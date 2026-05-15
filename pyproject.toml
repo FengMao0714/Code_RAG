@@ -3,7 +3,7 @@ name = "code-rag"
 version = "0.1.0"
 description = "代码知识库 RAG 问答助手 — 基于代码仓库的智能问答 CLI 工具"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     # CLI 框架
     "typer>=0.12",
