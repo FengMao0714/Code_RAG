@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+
+# ChromaDB local data
+.chroma/
+chroma_data/
+
+# Code-RAG index data
+.code-rag/
+
+# Embedding model cache
+models/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+
+# UV
+uv.lock
