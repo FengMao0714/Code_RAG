@@ -280,7 +280,7 @@ def chat(
     while True:
         try:
             question = console.input("[bold green]> [/bold green]")
-            if question.strip().lower() in ("exit", "quit", "q"):
+            if question.strip().lower() in ("exit", "quit", "q", "/exit", "/quit"):
                 console.print("[dim]再见！[/dim]")
                 break
             if not question.strip():

@@ -173,9 +173,17 @@ class ChromaStore:
         docs: list[str] = []
         metas: list[dict] = []
         vecs: list[list[float]] = []
+        seen_ids: set[str] = set()
 
         for chunk, embedding in zip(chunks, embeddings):
-            chunk_id = f"{chunk.file_path}:{chunk.start_line}"
+            # 用 chunk_type + source + start_line 生成哈希，
+            # 避免 module_summary 与同起始行的符号产生重复 ID
+            id_src = f"{chunk.chunk_type}:{chunk.source}:{chunk.start_line}"
+            chunk_id = f"{chunk.file_path}:{hashlib.sha256(id_src.encode()).hexdigest()[:12]}"
+            if chunk_id in seen_ids:
+                logger.debug("跳过重复 chunk: %s", chunk_id)
+                continue
+            seen_ids.add(chunk_id)
             ids.append(chunk_id)
             docs.append(chunk.source)
             metas.append(self._extract_metadata(chunk))
