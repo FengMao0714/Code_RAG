@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir *)",
+      "Bash(uv run *)",
+      "Bash(uv pip *)",
+      "Bash(pip index *)",
+      "mcp__plugin_serena_serena__create_text_file",
+      "Bash(cat)",
+      "Bash(python3 /tmp/write_scanner.py)",
+      "Bash(echo \"test\")",
+      "Read(//tmp/**)",
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(uv sync *)",
+      "Bash(printf '%s\\\\n' 'import pathlib' 'lines = []' 'def L\\(s=\"\"\\): lines.append\\(s\\)')",
+      "Bash(printf '%s\\\\n' 'L\\(\"#!/usr/bin/env python3\"\\)')",
+      "Bash(printf '%s\\\\n' 'L\\(\"x = 1\"\\)')",
+      "Bash(printf '%s\\\\n' 'pathlib.Path\\(\"/tmp/test_gen.py\"\\).write_text\\(\"\\\\\\\\n\".join\\(lines\\)\\)')"
+    ]
+  }
+}

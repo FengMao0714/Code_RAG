@@ -10,9 +10,22 @@ dependencies = [
     "rich>=13.0",
     # 向量数据库
     "chromadb>=0.5",
-    # 代码解析
+    # 代码解析 (tree-sitter + 各语言 grammar)
     "tree-sitter>=0.23",
-    "tree-sitter-languages>=1.10",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-typescript>=0.23",
+    "tree-sitter-java>=0.23",
+    "tree-sitter-go>=0.23",
+    "tree-sitter-c>=0.23",
+    "tree-sitter-cpp>=0.23",
+    "tree-sitter-rust>=0.23",
+    "tree-sitter-ruby>=0.23",
+    "tree-sitter-php>=0.23",
+    "tree-sitter-c-sharp>=0.23",
+    "tree-sitter-swift>=0.7",
+    "tree-sitter-lua>=0.5",
+    "tree-sitter-bash>=0.23",
     # LLM 调用 (OpenAI 兼容接口)
     "openai>=1.0",
     # 本地 Embedding
