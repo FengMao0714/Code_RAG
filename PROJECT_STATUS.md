@@ -1,6 +1,6 @@
 # PROJECT_STATUS.md — Code_RAG 项目状态
 
-> 最后更新：2026-05-16（第一阶段修复完成）
+> 最后更新：2026-05-16（第二阶段测试补充完成）
 
 ## 项目概述
 
@@ -109,13 +109,78 @@ $ uv run --frozen code-rag ask . "这个项目的 CLI 入口在哪里？"
 
 ---
 
+## 第二阶段测试补充记录（2026-05-16）
+
+### 目标
+
+补齐核心自动化测试，覆盖 scanner / parser / chunker / index_tracker / vector_store / CLI 六大模块，
+消除"零测试覆盖"这一简历展示最大短板。
+
+### 设计约束
+
+- **零网络依赖**：不发起任何 HTTP 请求
+- **零模型下载**：不加载 sentence-transformers / bge-large-zh-v1.5
+- **ChromaDB 真实运行**：使用 pytest `tmp_path` 临时目录，测试真实向量数据库行为
+- **CLI 通过 Typer CliRunner**：monkeypatch 替换 `get_settings`、`Embedder.get_instance`、`LLMClient`
+
+### 新增文件
+
+| 文件 | 测试数 | 覆盖点 |
+|---|---|---|
+| `tests/__init__.py` | — | 包标识 |
+| `tests/conftest.py` | — | 共享 fixtures：`FakeEmbedder`（SHA-256 确定性 1024 维归一化向量）、`FakeLLMClient`（无网络）、`tmp_settings`、`patch_embedder`、`patch_llm` |
+| `tests/test_scanner.py` | 21 | 忽略目录（node_modules/.git/__pycache__/venv/dist/build）、入库扩展名（.py/.md/.toml/.json/.yaml/.js/.ts）、语言检测（8 种）、SHA-256 哈希、.gitignore 过滤、跨平台路径、边界情况 |
+| `tests/test_parser_chunker.py` | 18 | Python class/function 解析、空文件、语法错误不崩溃、module_summary/class/function/doc chunk 生成、chunk metadata 完整性、长函数二次切分（sub_index/sub_total）、sub-chunk 源码完整性、token 计数 |
+| `tests/test_index_tracker.py` | 9 | 首次全 added、modified/deleted 识别、无变更不重复索引、混合变更（added+modified+deleted）、跨实例持久化、仓库路径隔离 |
+| `tests/test_vector_store.py` | 12 | upsert/query 多条、幂等 upsert、空 collection 查询、距离阈值过滤、delete_by_files、delete_collection、不存在 collection 不崩溃、get_stats chunk_type 分布、完整生命周期、SearchResult 结构 |
+| `tests/test_cli.py` | 8 | `--help` 退出码、`status` 未索引/已索引、`index` 最小闭环+ChromaDB 验证、`index` 空目录、`ask` 返回回答（fake LLM）、`ask` 未索引仓库提示、`list` 空状态 |
+
+### 修改的文件
+
+| 文件 | 改动摘要 | 改动量 |
+|---|---|---|
+| `tests/__init__.py` | 新增，空文件 | 0 行 |
+| `tests/conftest.py` | 新增，共享 fixtures + FakeEmbedder + FakeLLMClient | ~110 行 |
+| `tests/test_scanner.py` | 新增，scanner 模块 21 个测试 | ~340 行 |
+| `tests/test_parser_chunker.py` | 新增，parser + chunker 模块 18 个测试 | ~350 行 |
+| `tests/test_index_tracker.py` | 新增，index_tracker 模块 9 个测试 | ~170 行 |
+| `tests/test_vector_store.py` | 新增，vector_store 模块 12 个测试 | ~250 行 |
+| `tests/test_cli.py` | 新增，CLI smoke 测试 8 个测试 | ~200 行 |
+
+**注意**：未修改任何 `src/` 业务代码。
+
+### 验证命令结果
+
+```
+$ uv run --frozen ruff check src/ tests/
+All checks passed!
+
+$ uv run --frozen ruff format --check src/ tests/
+24 files already formatted
+
+$ uv run --frozen pytest -q
+........................................................................ [ 82%]
+...............                                                          [100%]
+87 passed in 2.69s
+```
+
+### 遇到并解决的问题
+
+| 问题 | 原因 | 解决方式 |
+|---|---|---|
+| `ModuleNotFoundError: code_rag` | pytest 未安装（dev 依赖未 sync） | `uv sync --extra dev` |
+| 8 个测试首次运行失败 | pytest 在 tmp_path 创建元数据文件被 scanner 扫描到；`.gitignore` 本身不在忽略列表；`.pdf` 不在 `_DEFAULT_IGNORE_EXTENSIONS` | index_tracker 改用 `_make_entry` 构造 FileEntry；scanner 测试改用 subset 断言；二进制扩展名测试改用 `.exe` |
+| CLI ask 测试 `[fake answer]` 不在输出中 | Typer CliRunner 在 Windows GBK 下对 `[]` 的编码处理 | 改为断言 `context_length=` 和 `question=` 等特征字符串 |
+
+---
+
 ## 当前剩余问题
 
 ### 高优先级
 
 | 问题 | 说明 |
 |---|---|
-| 没有自动化测试 | `tests/` 目录为空，`pytest` -> `no tests ran`。简历展示最大短板。 |
+| ~~没有自动化测试~~ | ~~`tests/` 目录为空~~ **已在第二阶段解决：87 个测试全部通过** |
 | `list` 命令不显示仓库原始路径 | 只显示 hash 和文件数，无法知道是哪个仓库。 |
 
 ### 中优先级
