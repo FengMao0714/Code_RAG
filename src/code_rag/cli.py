@@ -4,7 +4,13 @@
 """
 
 import logging
+import sys
 from pathlib import Path
+
+# Windows GBK 终端兼容：强制 stdout/stderr 使用 UTF-8，避免非 ASCII 字符崩溃
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 import typer
 from rich.console import Console
@@ -27,6 +33,7 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+console.legacy_windows = False  # 禁用旧版渲染器，避免 GBK 编码崩溃
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -53,7 +60,7 @@ def index(
         console.print(f"[red]错误：路径不存在: {repo_path}[/red]")
         raise typer.Exit(1)
 
-    console.print(f"[bold blue]📂 开始索引仓库: {repo_path}[/bold blue]")
+    console.print(f"[bold blue]>> 开始索引仓库: {repo_path}[/bold blue]")
 
     try:
         settings = get_settings()
@@ -63,7 +70,7 @@ def index(
 
         # 1. 扫描文件
         with Progress(
-            SpinnerColumn(),
+            SpinnerColumn(spinner_name="line"),
             TextColumn("[progress.description]{task.description}"),
             TimeElapsedColumn(),
             console=console,
@@ -75,7 +82,7 @@ def index(
 
         # 2. 检测变更
         with Progress(
-            SpinnerColumn(),
+            SpinnerColumn(spinner_name="line"),
             TextColumn("[progress.description]{task.description}"),
             TimeElapsedColumn(),
             console=console,
@@ -91,7 +98,7 @@ def index(
             )
 
         if not changes.has_changes:
-            console.print("[bold green]✅ 仓库无变更，无需更新索引[/bold green]")
+            console.print("[bold green][OK] 仓库无变更，无需更新索引[/bold green]")
             return
 
         # 3. 删除已删除文件的 chunks
@@ -110,7 +117,7 @@ def index(
         all_embeddings = []
 
         with Progress(
-            SpinnerColumn(),
+            SpinnerColumn(spinner_name="line"),
             TextColumn("[progress.description]{task.description}"),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             TextColumn("({task.completed}/{task.total})"),
@@ -169,7 +176,7 @@ def index(
 
         # 5. 生成 Embedding
         with Progress(
-            SpinnerColumn(),
+            SpinnerColumn(spinner_name="line"),
             TextColumn("[progress.description]{task.description}"),
             TimeElapsedColumn(),
             console=console,
@@ -181,7 +188,7 @@ def index(
 
         # 6. 写入 ChromaDB
         with Progress(
-            SpinnerColumn(),
+            SpinnerColumn(spinner_name="line"),
             TextColumn("[progress.description]{task.description}"),
             TimeElapsedColumn(),
             console=console,
@@ -194,7 +201,7 @@ def index(
         tracker.update_tracker(repo_path, file_entries)
 
         console.print(
-            f"[bold green]✅ 索引完成！[/bold green] "
+            f"[bold green][OK] 索引完成！[/bold green] "
             f"处理 {len(files_to_process)} 个文件，生成 {len(all_chunks)} 个切片"
         )
 
@@ -215,14 +222,14 @@ def ask(
     setup_logging(verbose)
     repo_path = repo_path.resolve()
 
-    console.print(f"[bold blue]🔍 正在检索: {question}[/bold blue]")
+    console.print(f"[bold blue]>> 正在检索: {question}[/bold blue]")
 
     try:
         settings = get_settings()
 
         # 检索
         with Progress(
-            SpinnerColumn(),
+            SpinnerColumn(spinner_name="line"),
             TextColumn("[progress.description]{task.description}"),
             TimeElapsedColumn(),
             console=console,
@@ -237,7 +244,7 @@ def ask(
             return
 
         # 生成回答（流式输出）
-        console.print("\n[bold]💬 回答：[/bold]\n")
+        console.print("\n[bold]>> 回答：[/bold]\n")
         llm = LLMClient(settings)
         for chunk in llm.generate_stream(result.context, question):
             console.print(chunk.content, end="")
@@ -266,7 +273,7 @@ def chat(
     setup_logging(verbose)
     repo_path = repo_path.resolve()
 
-    console.print(f"[bold blue]💬 进入交互模式 — 仓库: {repo_path}[/bold blue]")
+    console.print(f"[bold blue]>> 进入交互模式 — 仓库: {repo_path}[/bold blue]")
     console.print("[dim]输入 'exit' 或 'quit' 退出[/dim]\n")
 
     try:
@@ -336,9 +343,9 @@ def list_repos() -> None:
         console.print("[dim]暂无已索引的仓库[/dim]")
         return
 
-    console.print("[bold blue]📋 已索引的仓库：[/bold blue]")
+    console.print("[bold blue]>> 已索引的仓库：[/bold blue]")
     for hash_name, file_count in repos:
-        console.print(f"  • {hash_name} ({file_count} 个文件)")
+        console.print(f"  - {hash_name} ({file_count} 个文件)")
 
 
 @app.command()
@@ -347,7 +354,7 @@ def status(
 ) -> None:
     """查看仓库的索引状态。"""
     repo_path = repo_path.resolve()
-    console.print(f"[bold blue]📊 仓库索引状态: {repo_path}[/bold blue]")
+    console.print(f"[bold blue]>> 仓库索引状态: {repo_path}[/bold blue]")
 
     settings = get_settings()
     store = store_mod.ChromaStore(settings)
@@ -366,7 +373,7 @@ def status(
     if stats.get("chunk_types"):
         console.print("  切片类型分布:")
         for ctype, count in stats["chunk_types"].items():
-            console.print(f"    • {ctype}: {count}")
+            console.print(f"    - {ctype}: {count}")
 
 
 @app.command()
@@ -398,7 +405,7 @@ def remove(
     if tracker_path.exists():
         shutil.rmtree(tracker_path)
 
-    console.print(f"[bold green]✅ 已删除 {repo_path} 的索引数据[/bold green]")
+    console.print(f"[bold green][OK] 已删除 {repo_path} 的索引数据[/bold green]")
 
 
 if __name__ == "__main__":

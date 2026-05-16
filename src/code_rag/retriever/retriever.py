@@ -105,8 +105,12 @@ class Retriever:
         Raises:
             ValueError: 当仓库对应的 collection 不存在或为空时。
         """
-        top_k = top_k or self._settings.retrieval_top_k
-        score_threshold = score_threshold or self._settings.retrieval_score_threshold
+        top_k = top_k if top_k is not None else self._settings.retrieval_top_k
+        score_threshold = (
+            score_threshold
+            if score_threshold is not None
+            else self._settings.retrieval_score_threshold
+        )
 
         # 获取 collection 名称
         collection_name = ChromaStore.get_collection_name(repo_path)
@@ -128,6 +132,20 @@ class Retriever:
             top_k=top_k,
             max_distance=score_threshold,
         )
+
+        # top_k 保底回退：如果阈值过滤后无结果，放宽阈值取最相关的若干条
+        if not results:
+            logger.info(
+                "阈值 %.2f 过滤后无结果，回退到 top_%d（不限距离）",
+                score_threshold,
+                top_k,
+            )
+            results = self._store.query(
+                collection_name=collection_name,
+                embedding=query_embedding,
+                top_k=top_k,
+                max_distance=None,
+            )
 
         logger.info(
             "检索完成: 返回 %d 条结果 (阈值=%.2f)",

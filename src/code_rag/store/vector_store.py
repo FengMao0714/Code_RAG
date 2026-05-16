@@ -20,6 +20,12 @@ from code_rag.indexer.chunker import CodeChunk
 
 logger = logging.getLogger(__name__)
 
+# ChromaDB >=0.5 抛出 NotFoundError 而非 ValueError
+try:
+    from chromadb.errors import NotFoundError as _ChromaNotFoundError
+except (ImportError, ModuleNotFoundError):
+    _ChromaNotFoundError = ValueError  # type: ignore[misc,assignment]
+
 
 # ---------------------------------------------------------------------------
 # 检索结果
@@ -136,7 +142,7 @@ class ChromaStore:
         try:
             self._client.delete_collection(name=name)  # type: ignore[union-attr]
             logger.info("已删除 collection: %s", name)
-        except ValueError:
+        except _ChromaNotFoundError:
             logger.warning("collection 不存在，跳过删除: %s", name)
 
     # ------------------------------------------------------------------
@@ -311,7 +317,7 @@ class ChromaStore:
         """
         try:
             collection = self._client.get_collection(name=collection_name)  # type: ignore[union-attr]
-        except ValueError:
+        except _ChromaNotFoundError:
             return {"total_chunks": 0, "exists": False}
 
         total = collection.count()

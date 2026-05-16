@@ -72,10 +72,16 @@ _register(
 # 文档类扩展（不经过 AST 解析，作为 doc chunk 直接入库）
 DOC_EXTENSIONS: frozenset[str] = frozenset(
     {
+        # 纯文档
         ".md",
         ".rst",
         ".txt",
         ".adoc",
+        # 项目配置文件
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
     }
 )
 

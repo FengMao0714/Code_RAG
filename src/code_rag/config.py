@@ -37,7 +37,7 @@ class Settings(BaseSettings):
 
     # ---------- 检索配置 ----------
     retrieval_top_k: int = 8
-    retrieval_score_threshold: float = 0.5
+    retrieval_score_threshold: float = 0.7
 
     # ---------- 索引配置 ----------
     index_tracker_dir: str = "~/.code-rag/indexes"
