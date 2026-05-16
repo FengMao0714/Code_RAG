@@ -1,6 +1,6 @@
 # PROJECT_STATUS.md — Code_RAG 项目状态
 
-> 最后更新：2026-05-16（第二阶段测试补充完成）
+> 最后更新：2026-05-16（第三阶段 RAG 检索质量优化完成）
 
 ## 项目概述
 
@@ -174,13 +174,116 @@ $ uv run --frozen pytest -q
 
 ---
 
+## 第三阶段：优化 RAG 检索质量（2026-05-16）
+
+### 目标
+
+优化检索链路，让 `ask` 命令能准确回答"CLI 入口在哪里"、"scanner 如何过滤文件"等问题，不再只依赖向量分数。
+
+### 解决的问题
+
+#### 1. 检索结果中 cli.py、pyproject.toml 等关键文件被向量阈值过滤（高优先级）
+
+**现象**：问"CLI 入口在哪里"，`src/code_rag/cli.py` 的向量距离约 0.59，虽低于阈值 0.7，但因 top_k=8 只取最相似的 8 条，cli.py 排在第 30 名之后被截断，LLM 看不到核心代码。
+
+**根因**：
+- 检索只取 top_k=8 个最相似的候选，距离阈值在 ChromaDB 查询层过滤
+- 中文问题 vs 英文代码的向量距离天然较高，代码文件难以进入 top_k
+- 没有利用 chunk 的 `file_path`、`name` 等 metadata 做辅助排序
+
+**修复方案**：
+- 候选池扩大到 `top_k * 5`（最少 50），在 ChromaDB 层不做距离过滤
+- 新增 `boost_by_metadata()`：从查询中提取标识符（文件名、函数名、类名、中文关键词），匹配 `file_path`/`name`/`parent` 的 chunk 排到结果前面
+- 距离阈值改为本地过滤，保证 boost 后的高相关 chunk 不被误杀
+
+#### 2. 上下文缺少检索质量信息（中优先级）
+
+**现象**：LLM 回答时无法知道哪些代码片段是高置信命中、哪些是兜底召回，也无法看到文件路径和行号以外的元数据。
+
+**修复方案**：
+- `CONTEXT_CHUNK_TEMPLATE` 增加 `score`（检索距离）、`language`（语言）字段
+- `ContextBuilder.build_context()` 新增 `scores` 参数，逐 chunk 填充距离分数
+
+#### 3. 没有检索调试手段（中优先级）
+
+**现象**：调试"为什么这个问题召回不到正确 chunk"只能靠加日志，没有直接查看召回结果的命令。
+
+**修复方案**：
+- CLI 新增 `search` 子命令，只执行检索 + 显示结果（文件、分数、类型、行号），不调用 LLM
+
+#### 4. Retriever 模块零测试覆盖（中优先级）
+
+**现象**：87 个测试中没有一个是针对 `Retriever` 或 `ContextBuilder` 的。
+
+**修复方案**：新增 `tests/test_retriever.py`，28 个测试覆盖关键词提取、metadata boost、上下文格式化、集成检索。
+
+---
+
+### 修改的文件
+
+| 文件 | 改动摘要 | 改动量 |
+|---|---|---|
+| `src/code_rag/generator/prompts.py` | `CONTEXT_CHUNK_TEMPLATE` 增加 `score`、`language` 字段 | ~5 行 |
+| `src/code_rag/retriever/retriever.py` | 新增 `_extract_keywords()`、`boost_by_metadata()`；`retrieve()` 改为三阶段流程（扩大候选池 → boost 重排 → 本地阈值过滤）；`build_context()` 增加 `scores` 参数；`retrieve_with_context()` 传递 scores | ~120 行 |
+| `src/code_rag/cli.py` | 新增 `search` 命令（调试检索，不调用 LLM） | ~45 行 |
+| `tests/test_retriever.py` | 新增，28 个测试 | ~460 行 |
+
+### 检索流程变化
+
+**修改前**：
+```
+问题 → Embedder → ChromaDB(top_k=8, 阈值过滤) → ContextBuilder(无score) → LLM
+```
+
+**修改后**：
+```
+问题 → Embedder → ChromaDB(候选池 top_k×5, 不限距离)
+     → _extract_keywords 提取标识符(file/class/function/中文2字组)
+     → boost_by_metadata 重排(file_path/name/parent 匹配的排前面)
+     → 本地阈值过滤(≤0.7 保留, 无结果则回退取全部)
+     → 截取 top_k
+     → ContextBuilder(含 score/file/lines/language)
+     → LLM
+```
+
+### 验证命令结果
+
+```
+$ uv run --frozen ruff check src/ tests/
+All checks passed!
+
+$ uv run --frozen ruff format --check src/ tests/
+25 files already formatted
+
+$ uv run --frozen pytest -q
+........................................................................ [ 62%]
+...........................................                              [100%]
+115 passed in 9.28s
+
+$ uv run --frozen code-rag search . "这个项目的 CLI 入口在哪里？"
+>> 检索调试: 这个项目的 CLI 入口在哪里？
+检索到 8 条结果:
+  [1] score=0.5886  type=module_summary  name=cli.py  file=src/code_rag/cli.py
+  [2] score=0.5918  type=module_summary  name=cli.py  file=src/code_rag/cli.py
+  [3] score=0.5996  type=class  name=TestStatusCommand  file=tests/test_cli.py
+  ...
+
+$ uv run --frozen code-rag ask . "这个项目的 CLI 入口在哪里？"
+检索到 8 条结果 (阈值=0.70)
+LLM 回答：
+  - 正确引用 src/code_rag/cli.py (typer.Typer app 定义，第15-18行)
+  - 正确引用 pyproject.toml [project.scripts] 配置
+  - 给出完整入口链路: app -> @app.command() -> code-rag = "code_rag.cli:app"
+```
+
+---
+
 ## 当前剩余问题
 
 ### 高优先级
 
 | 问题 | 说明 |
 |---|---|
-| ~~没有自动化测试~~ | ~~`tests/` 目录为空~~ **已在第二阶段解决：87 个测试全部通过** |
 | `list` 命令不显示仓库原始路径 | 只显示 hash 和文件数，无法知道是哪个仓库。 |
 
 ### 中优先级
@@ -189,8 +292,8 @@ $ uv run --frozen pytest -q
 |---|---|
 | `chat` 是循环单轮问答 | 没有保留对话历史，每轮都是独立检索 + 生成。 |
 | parser 不检查语法错误 | 有语法错误的文件不崩溃，但错误代码也会被解析出符号，可能污染索引。 |
-| class chunk 可能保留方法体 | 设计文档说"不含方法体"，但实现中 `_chunk_class` 的跳过逻辑不完整。 |
-| ChromaDB `extra_metadata` 丢失 | upsert 时存了 `extra_metadata` JSON 字符串，但 query 重建 `CodeChunk` 时未恢复。 |
+| class chunk 可能保留方法体 | 设计文档说"不含方法体"，但实现中 `_chunk_class` 的跳过逻辑不完整（方法体内空行会提前结束 skip_body）。 |
+| ChromaDB `extra_metadata` 丢失 | upsert 时存了 `extra_metadata` JSON 字符串，但 `_reconstruct_chunk` 重建时未恢复 `CodeChunk.metadata`，导致 sub_index/sub_total 信息丢失。 |
 | `.env` 中硬编码了真实 API Key | 应该移到 `.env.local` 并加入 `.gitignore`。 |
 
 ### 低优先级
@@ -200,4 +303,4 @@ $ uv run --frozen pytest -q
 | README 与实际文件不一致 | 提到 `utils/file_utils.py` 但实际不存在。 |
 | 首次加载 Embedding 模型 HF 日志过多 | CLI 体验偏吵，可降低 logging level。 |
 | `list` 显示体验一般 | 只显示仓库 hash 和文件数，建议显示原始路径和最后索引时间。 |
-| prompts.py 中有 emoji | `CONTEXT_CHUNK_TEMPLATE` 中的 emoji 不会直接输出到终端（传给 LLM），但 LLM 回传时可能触发编码问题。 |
+| embedding 模型与 tokenizer 不对齐 | chunker 用 `cl100k_base`（OpenAI）计 token，embedding 用 `BAAI/bge-large-zh-v1.5`（自有 tokenizer），`max_chunk_tokens=512` 语义不精确。 |

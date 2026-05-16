@@ -408,5 +408,60 @@ def remove(
     console.print(f"[bold green][OK] 已删除 {repo_path} 的索引数据[/bold green]")
 
 
+@app.command()
+def search(
+    repo_path: Path = typer.Argument(..., help="代码仓库路径"),
+    query: str = typer.Argument(..., help="检索查询"),
+    top_k: int = typer.Option(8, "--top-k", "-k", help="最大返回结果数"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
+) -> None:
+    """调试检索：只显示召回结果，不调用 LLM。"""
+    setup_logging(verbose)
+    repo_path = repo_path.resolve()
+
+    console.print(f"[bold blue]>> 检索调试: {query}[/bold blue]")
+
+    try:
+        settings = get_settings()
+
+        # 检查 collection 是否存在
+        store = store_mod.ChromaStore(settings)
+        coll_name = store_mod.ChromaStore.get_collection_name(repo_path)
+        stats = store.get_stats(coll_name)
+
+        if not stats["exists"]:
+            console.print("[yellow]该仓库尚未索引，请先运行 index 命令[/yellow]")
+            raise typer.Exit(0)
+
+        # 执行检索
+        retriever = Retriever(settings)
+        results = retriever.retrieve(query, repo_path, top_k=top_k)
+
+        if not results:
+            console.print("[yellow]未检索到任何结果[/yellow]")
+            raise typer.Exit(0)
+
+        # 输出结果
+        console.print(f"\n[bold]检索到 {len(results)} 条结果:[/bold]\n")
+        for i, result in enumerate(results, 1):
+            chunk = result.chunk
+            console.print(
+                f"  [{i}] score={result.score:.4f}  "
+                f"type={chunk.chunk_type}  "
+                f"name={chunk.name}  "
+                f"file={chunk.file_path}  "
+                f"lines={chunk.start_line}-{chunk.end_line}"
+            )
+            if chunk.parent:
+                console.print(f"      parent={chunk.parent}")
+        console.print()
+
+    except Exception as exc:
+        console.print(f"[red]错误: {exc}[/red]")
+        if verbose:
+            console.print_exception()
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()

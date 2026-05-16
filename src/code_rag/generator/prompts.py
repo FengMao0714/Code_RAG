@@ -29,9 +29,13 @@ USER_PROMPT_TEMPLATE = """## 用户问题
 
 请基于上面提供的代码上下文回答这个问题。"""
 
-CONTEXT_CHUNK_TEMPLATE = """### [{chunk_type}] {name}
-📄 文件: {file_path} (行 {start_line}-{end_line})
-```{language}
-{content}
-```
-"""
+CONTEXT_CHUNK_TEMPLATE = (
+    "### [{chunk_type}] {name}\n"
+    "- file: {file_path}\n"
+    "- lines: {start_line}-{end_line}\n"
+    "- language: {language}\n"
+    "- score: {score}\n"
+    "```{language}\n"
+    "{content}\n"
+    "```"
+)
