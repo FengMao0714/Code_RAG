@@ -16,7 +16,11 @@
       "Bash(printf '%s\\\\n' 'import pathlib' 'lines = []' 'def L\\(s=\"\"\\): lines.append\\(s\\)')",
       "Bash(printf '%s\\\\n' 'L\\(\"#!/usr/bin/env python3\"\\)')",
       "Bash(printf '%s\\\\n' 'L\\(\"x = 1\"\\)')",
-      "Bash(printf '%s\\\\n' 'pathlib.Path\\(\"/tmp/test_gen.py\"\\).write_text\\(\"\\\\\\\\n\".join\\(lines\\)\\)')"
+      "Bash(printf '%s\\\\n' 'pathlib.Path\\(\"/tmp/test_gen.py\"\\).write_text\\(\"\\\\\\\\n\".join\\(lines\\)\\)')",
+      "mcp__plugin_serena_serena__find_file",
+      "mcp__plugin_serena_serena__list_dir",
+      "mcp__plugin_serena_serena__activate_project",
+      "mcp__plugin_serena_serena__read_file"
     ]
   }
 }
