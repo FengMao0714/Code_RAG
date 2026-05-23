@@ -185,6 +185,8 @@ class TestCodeChunker:
         class_chunks = [c for c in chunks if c.chunk_type == "class"]
         assert len(class_chunks) >= 1
         assert class_chunks[0].name == "Calculator"
+        assert "def add" in class_chunks[0].source
+        assert "return a + b" not in class_chunks[0].source
 
         method_chunks = [
             c for c in chunks if c.chunk_type == "function" and c.parent == "Calculator"

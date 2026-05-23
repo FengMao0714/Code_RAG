@@ -104,6 +104,15 @@ class TestDefaultIgnoreDirs:
         assert _names(entries) == ["main.py"]
         assert _rel_paths(entries) == ["src/main.py"]
 
+    def test_ignores_internal_index_dirs(self, tmp_path: Path) -> None:
+        _create_file(tmp_path / ".chroma" / "chroma.sqlite3", "db")
+        _create_file(tmp_path / ".indexes" / "tracker.json", "{}")
+        _create_file(tmp_path / "chroma_data" / "chroma.sqlite3", "db")
+        _create_file(tmp_path / "src" / "main.py", "print('hi')")
+
+        entries = RepoScanner(tmp_path).scan()
+        assert _rel_paths(entries) == ["src/main.py"]
+
 
 # ---------------------------------------------------------------------------
 # 应入库文件扩展名
@@ -174,6 +183,14 @@ class TestScannableExtensions:
         assert "archive.zip" not in names
         assert "lib.so" not in names
         assert "app.exe" not in names
+
+    def test_ignores_unsupported_extensions(self, tmp_path: Path) -> None:
+        _create_file(tmp_path / "debug.log", "runtime log")
+        _create_file(tmp_path / "notes.xyz", "unknown")
+        _create_file(tmp_path / "ok.py", "x = 1")
+
+        entries = RepoScanner(tmp_path).scan()
+        assert _names(entries) == ["ok.py"]
 
 
 # ---------------------------------------------------------------------------
@@ -258,15 +275,15 @@ class TestGitignoreFilter:
         assert "debug.log" not in names
 
     def test_negation_pattern(self, tmp_path: Path) -> None:
-        _create_file(tmp_path / ".gitignore", "*.log\n!important.log\n")
-        _create_file(tmp_path / "debug.log", "debug")
-        _create_file(tmp_path / "important.log", "important")
+        _create_file(tmp_path / ".gitignore", "*.md\n!important.md\n")
+        _create_file(tmp_path / "debug.md", "debug")
+        _create_file(tmp_path / "important.md", "important")
         _create_file(tmp_path / "app.py", "x = 1")
 
         entries = RepoScanner(tmp_path).scan()
         names = _names(entries)
-        assert "important.log" in names
-        assert "debug.log" not in names
+        assert "important.md" in names
+        assert "debug.md" not in names
 
     def test_ignores_directory_pattern(self, tmp_path: Path) -> None:
         _create_file(tmp_path / ".gitignore", "docs/\n")

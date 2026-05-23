@@ -107,6 +107,9 @@ _DEFAULT_IGNORE_DIRS: frozenset[str] = frozenset(
         ".idea",
         ".vscode",
         ".code-rag",
+        ".chroma",
+        ".indexes",
+        "chroma_data",
         "target",  # Rust / Java
         "vendor",  # Go / PHP
     }
@@ -417,6 +420,7 @@ class RepoScanner:
             "default_dir": 0,
             "default_file": 0,
             "default_ext": 0,
+            "unsupported_ext": 0,
             "size_limit": 0,
             "unreadable": 0,
         }
@@ -483,6 +487,9 @@ class RepoScanner:
 
                 # 语言检测
                 language = detect_language(ext)
+                if language is None:
+                    skipped["unsupported_ext"] += 1
+                    continue
 
                 # 计算哈希
                 try:

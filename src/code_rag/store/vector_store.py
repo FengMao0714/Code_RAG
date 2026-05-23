@@ -401,6 +401,13 @@ class ChromaStore:
         Returns:
             重建的 :class:`CodeChunk` 实例。
         """
+        extra_metadata_raw = metadata.get("extra_metadata", "{}")
+        try:
+            extra_metadata = json.loads(extra_metadata_raw) if extra_metadata_raw else {}
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("无法解析 chunk extra_metadata，已忽略: %r", extra_metadata_raw)
+            extra_metadata = {}
+
         return CodeChunk(
             file_path=metadata.get("file_path", ""),
             language=metadata.get("language", ""),
@@ -412,4 +419,5 @@ class ChromaStore:
             file_hash=metadata.get("file_hash", ""),
             source=source,
             token_count=metadata.get("token_count", 0),
+            metadata=extra_metadata,
         )

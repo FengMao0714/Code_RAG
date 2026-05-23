@@ -302,3 +302,16 @@ class TestChromaStoreIntegration:
         assert isinstance(results[0], SearchResult)
         assert isinstance(results[0].chunk, CodeChunk)
         assert isinstance(results[0].score, float)
+
+    def test_extra_metadata_roundtrip(self, tmp_path: Path) -> None:
+        store = ChromaStore(_make_settings(tmp_path))
+        coll_name = "test-extra-metadata"
+
+        chunk = _make_chunk(source="def huge(): pass")
+        chunk.metadata["sub_index"] = 1
+        chunk.metadata["sub_total"] = 3
+        store.upsert_chunks(coll_name, [chunk], [_fake_embedding(seed=9)])
+
+        results = store.query(coll_name, _fake_embedding(seed=9), top_k=1)
+        assert len(results) == 1
+        assert results[0].chunk.metadata == {"sub_index": 1, "sub_total": 3}

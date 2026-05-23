@@ -292,10 +292,16 @@ class CodeChunker:
         class_lines = sym.source.splitlines(keepends=True)
         result_lines: list[str] = []
         in_docstring = False
-        skip_body = False
+        method_indent: int | None = None
 
         for line in class_lines:
             stripped = line.strip()
+
+            if method_indent is not None:
+                indent = _indent_width(line)
+                if not stripped or indent > method_indent:
+                    continue
+                method_indent = None
 
             # 处理 docstring（三引号字符串）
             if not in_docstring and _is_docstring_start(stripped):
@@ -315,17 +321,8 @@ class CodeChunker:
             # 方法定义行：保留签名，跳过方法体
             if _is_method_def(stripped):
                 result_lines.append(line)
-                skip_body = True
+                method_indent = _indent_width(line)
                 continue
-
-            # 类体内的内容：如果是缩进的方法体则跳过
-            if skip_body and _is_indented(stripped):
-                # 空行结束方法体
-                if not stripped:
-                    skip_body = False
-                continue
-
-            skip_body = False
 
             # 类签名行、空行、注释、类级变量赋值
             result_lines.append(line)
@@ -722,6 +719,19 @@ def _is_method_def(stripped: str) -> bool:
             stripped,
         )
     )
+
+
+def _indent_width(line: str) -> int:
+    """计算行首缩进宽度，tab 按 4 个空格近似处理。"""
+    width = 0
+    for char in line:
+        if char == " ":
+            width += 1
+        elif char == "\t":
+            width += 4
+        else:
+            break
+    return width
 
 
 def _is_indented(stripped: str) -> bool:
