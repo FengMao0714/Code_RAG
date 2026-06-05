@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-large-zh-v1.5"
     embedding_device: str = "cpu"
     embedding_cache_dir: str | None = None
+    embedding_offline: bool = False
+    """是否只从本地路径或 Hugging Face 缓存加载 Embedding 模型。"""
 
     # ---------- ChromaDB 配置 ----------
     chroma_persist_dir: str = "~/.code-rag/chroma"

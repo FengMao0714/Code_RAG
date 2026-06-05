@@ -7,7 +7,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+from pathlib import Path
+from typing import Any
 
 from code_rag.config import Settings, get_settings
 
@@ -85,25 +88,119 @@ class Embedder:
         except ImportError:
             raise RuntimeError("sentence-transformers 未安装。请执行: uv add sentence-transformers")
 
-        kwargs: dict = {}
-        if self._settings.embedding_cache_dir:
-            kwargs["cache_folder"] = self._settings.embedding_cache_dir
-
         try:
             logger.info(
                 "正在加载 Embedding 模型: %s (device=%s)",
                 self._model_name,
                 self._device,
             )
-            self._model = SentenceTransformer(self._model_name, device=self._device, **kwargs)
+            local_model_path = self._resolve_local_model_path()
+            self._model = self._load_with_device(
+                SentenceTransformer,
+                device=self._device,
+                local_files_only=True,
+                model_name_or_path=local_model_path,
+            )
+            logger.info("Embedding 模型已从本地缓存加载")
             logger.info("Embedding 模型加载完成")
-        except (OSError, RuntimeError) as exc:
-            if self._device == "cpu":
+        except (OSError, RuntimeError) as local_exc:
+            if self._settings.embedding_offline or self._looks_like_local_model_path():
+                raise RuntimeError(f"本地 Embedding 模型加载失败: {local_exc}") from local_exc
+            logger.info(
+                "本地缓存未命中，尝试从 Hugging Face Hub 下载或补全模型: %s",
+                self._model_name,
+            )
+            try:
+                self._model = self._load_with_device(
+                    SentenceTransformer,
+                    device=self._device,
+                    local_files_only=False,
+                    model_name_or_path=self._model_name,
+                )
+                logger.info("Embedding 模型加载完成")
+            except (OSError, RuntimeError) as exc:
                 raise RuntimeError(f"模型加载失败: {exc}") from exc
-            logger.warning("设备 '%s' 加载失败，回退到 CPU: %s", self._device, exc)
-            self._model = SentenceTransformer(self._model_name, device="cpu", **kwargs)
-            self._device = "cpu"
-            logger.info("已回退到 CPU 设备")
+
+    def _load_with_device(
+        self,
+        sentence_transformer_cls: Any,
+        *,
+        device: str,
+        local_files_only: bool,
+        model_name_or_path: str,
+    ) -> Any:
+        """按指定设备和离线策略加载 SentenceTransformer，必要时回退 CPU。"""
+        kwargs = self._model_kwargs(local_files_only=local_files_only)
+        previous_env = self._enable_hf_offline_env() if local_files_only else None
+        try:
+            try:
+                return sentence_transformer_cls(model_name_or_path, device=device, **kwargs)
+            except (OSError, RuntimeError):
+                if device == "cpu":
+                    raise
+                logger.warning("设备 '%s' 加载失败，回退到 CPU", device)
+                self._device = "cpu"
+                return sentence_transformer_cls(model_name_or_path, device="cpu", **kwargs)
+        except (OSError, RuntimeError):
+            if previous_env is not None:
+                self._restore_hf_env(previous_env)
+            raise
+
+    def _model_kwargs(self, *, local_files_only: bool) -> dict[str, Any]:
+        """构造 SentenceTransformer 加载参数。"""
+        kwargs: dict[str, Any] = {"local_files_only": local_files_only}
+        if self._settings.embedding_cache_dir:
+            kwargs["cache_folder"] = self._settings.embedding_cache_dir
+        return kwargs
+
+    def _looks_like_local_model_path(self) -> bool:
+        """判断 embedding_model 是否看起来是本地模型路径。"""
+        raw = self._model_name
+        path = Path(raw).expanduser()
+        return path.exists() or path.is_absolute() or raw.startswith((".", "~"))
+
+    def _resolve_local_model_path(self) -> str:
+        """把模型名解析成本地路径，避免 SentenceTransformer 再访问 Hub 元数据。"""
+        path = Path(self._model_name).expanduser()
+        if path.exists():
+            return str(path.resolve())
+
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as exc:
+            raise OSError("huggingface_hub 未安装，无法解析本地模型缓存") from exc
+
+        try:
+            return snapshot_download(
+                repo_id=self._model_name,
+                cache_dir=self._settings.embedding_cache_dir,
+                local_files_only=True,
+            )
+        except Exception as exc:
+            raise OSError(f"本地模型缓存未命中: {self._model_name}") from exc
+
+    @staticmethod
+    def _enable_hf_offline_env() -> dict[str, str | None]:
+        """开启 Hugging Face 离线模式，并返回旧环境值。"""
+        keys = (
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+            "HF_DATASETS_OFFLINE",
+            "HF_HUB_DISABLE_TELEMETRY",
+        )
+        previous = {key: os.environ.get(key) for key in keys}
+        for key in keys:
+            os.environ[key] = "1"
+        return previous
+
+    @staticmethod
+    def _restore_hf_env(previous: dict[str, str | None]) -> None:
+        """恢复 Hugging Face 相关环境变量。"""
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def _encode(self, texts: list[str]) -> list[list[float]]:
         """底层编码方法，直接调用 SentenceTransformer.encode()。

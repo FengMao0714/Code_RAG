@@ -52,9 +52,6 @@ Thumbs.db
 htmlcov/
 .coverage
 
-# UV
-uv.lock
-
 # Generated reports
 reports/
 .eval_outputs/

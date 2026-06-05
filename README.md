@@ -156,6 +156,10 @@ uv run code-rag chat /path/to/your/repo
 uv run code-rag agent /path/to/your/repo "把登录流程拆成子任务并指出关键文件" --plan-only
 ```
 
+Embedding 模型在本机运行。默认会先从本地路径或 Hugging Face 缓存加载；
+缓存不存在时才联网下载一次。需要强制离线时，在 `.env` 设置
+`EMBEDDING_OFFLINE=true`。
+
 ---
 
 ## CLI 命令
