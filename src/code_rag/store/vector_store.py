@@ -117,6 +117,34 @@ class ChromaStore:
         digest = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:12]
         return f"code-rag-{digest}"
 
+    @staticmethod
+    def get_collection_name_from_key(collection_key: str) -> str:
+        """根据稳定的 :class:`RepoIdentity.collection_key` 生成 collection 名称。
+
+        支持 local path 和 git URL 统一入口。``collection_key`` 应来自
+        :class:`~code_rag.repository.models.RepoIdentity`，例如：
+
+        - ``a1b2c3d4e5f6``（本地路径，与 :meth:`get_collection_name` 完全相同）
+        - ``git-12345678-main``（git 仓库 + ref）
+
+        特殊处理：如果是 12 位十六进制字符串（来自本地路径），
+        直接返回 ``code-rag-<key>``，与老 :meth:`get_collection_name` 行为一致，
+        保证老的本地索引不会失效。
+
+        Args:
+            collection_key: 来自 :class:`RepoIdentity` 的稳定 key。
+
+        Returns:
+            规范化的 collection 名称。
+        """
+        if not collection_key:
+            raise ValueError("collection_key 不能为空")
+        # 本地路径：12 位十六进制，与老逻辑完全一致
+        if len(collection_key) == 12 and all(c in "0123456789abcdef" for c in collection_key):
+            return f"code-rag-{collection_key}"
+        digest = hashlib.sha256(collection_key.encode("utf-8")).hexdigest()[:12]
+        return f"code-rag-{digest}"
+
     def get_or_create_collection(self, name: str) -> object:
         """获取或创建指定名称的 collection。
 

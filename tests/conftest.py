@@ -23,6 +23,7 @@ def tmp_settings(tmp_path: Path) -> Settings:
     return Settings(
         chroma_persist_dir=str(tmp_path / "chroma"),
         index_tracker_dir=str(tmp_path / "indexes"),
+        repo_cache_dir=str(tmp_path / "repos"),
         llm_api_key="test-key-not-real",
         llm_base_url="http://localhost:9999/v1",
         llm_model="fake-model",

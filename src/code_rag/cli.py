@@ -1,7 +1,19 @@
 """CLI 入口模块。
 
 使用 typer + rich 提供美观的命令行交互界面。
+CLI 只负责参数解析和 Rich 展示，业务编排由
+:mod:`code_rag.services` 提供。
+
+本模块支持两种仓库输入源：
+
+- **本地路径**（向后兼容）：``code-rag index /path/to/repo``
+- **Git 仓库 URL**（新增）：``code-rag index https://github.com/owner/repo --ref main``
+
+所有 ``source`` 参数同时接受本地路径与 Git URL，远程仓库会被自动
+clone 到 ``repo_cache_dir`` 缓存目录后再走原有索引 / 检索链路。
 """
+
+from __future__ import annotations
 
 import logging
 import sys
@@ -16,15 +28,18 @@ import typer
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
 
 from code_rag.config import get_settings
 from code_rag.generator import LLMClient
-from code_rag.indexer import chunker as chunker_mod
-from code_rag.indexer import embedder as embedder_mod
-from code_rag.indexer import parser as parser_mod
-from code_rag.indexer import scanner as scanner_mod
+from code_rag.repository import (
+    CacheManager,
+    GitRepositoryError,
+    parse_repo_source,
+    resolve_repo,
+)
 from code_rag.retriever import Retriever
-from code_rag.store import index_tracker as tracker_mod
+from code_rag.services import IndexService, ManifestService, QueryService
 from code_rag.store import vector_store as store_mod
 
 app = typer.Typer(
@@ -32,6 +47,12 @@ app = typer.Typer(
     help="代码知识库 RAG 问答助手 — 基于代码仓库的智能问答 CLI 工具",
     add_completion=False,
 )
+cache_app = typer.Typer(
+    name="cache",
+    help="管理远程仓库的本地缓存（list / prune）",
+    add_completion=False,
+)
+app.add_typer(cache_app)
 console = Console()
 console.legacy_windows = False  # 禁用旧版渲染器，避免 GBK 编码崩溃
 
@@ -47,187 +68,113 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# 共用 source 选项
+# ---------------------------------------------------------------------------
+
+
+def _source_options(
+    ref: str | None,
+    refresh: bool,
+) -> tuple[str | None, bool]:
+    """把 ``--ref`` / ``--refresh`` 透传给 service。"""
+    return ref, refresh
+
+
 @app.command()
 def index(
-    repo_path: Path = typer.Argument(..., help="代码仓库路径"),
+    source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
+    ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="强制刷新远程仓库缓存（仅 git URL 生效）"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
-    """索引代码仓库（首次全量，后续增量更新）。"""
+    """索引代码仓库（首次全量，后续增量更新）。支持本地路径与 Git URL。"""
     setup_logging(verbose)
-    repo_path = repo_path.resolve()
-
-    if not repo_path.exists():
-        console.print(f"[red]错误：路径不存在: {repo_path}[/red]")
-        raise typer.Exit(1)
-
-    console.print(f"[bold blue]>> 开始索引仓库: {repo_path}[/bold blue]")
+    kind = parse_repo_source(source).kind
+    console.print(
+        f"[bold blue]>> 开始索引仓库 ({kind}): {source}"
+        + (f" @ {ref}" if ref else "")
+        + "[/bold blue]"
+    )
 
     try:
         settings = get_settings()
-        tracker = tracker_mod.IndexTracker(settings)
-        store = store_mod.ChromaStore(settings)
-        collection_name = store_mod.ChromaStore.get_collection_name(repo_path)
+        service = IndexService(settings)
+        manifest_service = ManifestService(settings)
 
-        # 1. 扫描文件
         with Progress(
             SpinnerColumn(spinner_name="line"),
             TextColumn("[progress.description]{task.description}"),
             TimeElapsedColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("扫描文件...", total=None)
-            file_scanner = scanner_mod.RepoScanner(repo_path)
-            file_entries = file_scanner.scan()
-            progress.update(task, description=f"扫描完成: {len(file_entries)} 个文件")
+            task = progress.add_task("索引中...", total=None)
 
-        # 2. 检测变更
-        with Progress(
-            SpinnerColumn(spinner_name="line"),
-            TextColumn("[progress.description]{task.description}"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("检测变更...", total=None)
-            changes = tracker.get_changes(repo_path, file_entries)
-            added = len(changes.added)
-            modified = len(changes.modified)
-            deleted = len(changes.deleted)
-            progress.update(
-                task,
-                description=f"变更检测: +{added} ~{modified} -{deleted}",
-            )
+            def _cb(stage: str, message: str) -> None:
+                progress.update(task, description=message)
 
-        if not changes.has_changes:
+            result = service.run_index(source, progress=_cb, ref=ref, refresh=refresh)
+
+        if not result.had_changes:
             console.print("[bold green][OK] 仓库无变更，无需更新索引[/bold green]")
             return
 
-        # 3. 删除已删除文件的 chunks
-        if changes.deleted:
-            deleted_paths = [entry.rel_path for entry in changes.deleted]
-            store.delete_by_files(collection_name, deleted_paths)
-            console.print(f"[dim]已删除 {len(deleted_paths)} 个文件的索引[/dim]")
+        # 写入 manifest（包含真实 chunk 统计）
+        collection_name = result.collection_name
+        store = store_mod.ChromaStore(settings)
+        stats = store.get_stats(collection_name)
+        # 重新解析一次，以获取完整 ResolvedRepo（含 source_type / canonical_source）
+        from code_rag.repository import resolve_repo
 
-        # 4. 解析 + 切片 + Embedding
-        files_to_process = changes.added + changes.modified
-        code_parser = parser_mod.CodeParser()
-        chunker = chunker_mod.CodeChunker(max_chunk_tokens=settings.max_chunk_tokens)
-        embedder = embedder_mod.Embedder.get_instance(settings)
-
-        all_chunks = []
-        all_embeddings = []
-
-        with Progress(
-            SpinnerColumn(spinner_name="line"),
-            TextColumn("[progress.description]{task.description}"),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("({task.completed}/{task.total})"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("解析代码...", total=len(files_to_process))
-
-            for entry in files_to_process:
-                progress.update(task, advance=0, description=f"解析: {entry.rel_path}")
-
-                # 文档文件
-                if entry.is_doc:
-                    try:
-                        source = entry.abs_path.read_text(encoding="utf-8", errors="replace")
-                        from code_rag.indexer.parser import ParsedSymbol
-
-                        doc_sym = ParsedSymbol(
-                            file_path=entry.rel_path,
-                            language="doc",
-                            chunk_type="doc",
-                            name=entry.rel_path,
-                            start_line=1,
-                            end_line=source.count("\n") + 1,
-                            parent=None,
-                            source=source,
-                        )
-                        file_chunks = chunker.chunk([doc_sym], entry.file_hash, full_source=source)
-                    except Exception as exc:
-                        console.print(f"[yellow]警告: 无法读取 {entry.rel_path}: {exc}[/yellow]")
-                        progress.advance(task)
-                        continue
-
-                # 代码文件
-                elif entry.is_code and entry.language:
-                    symbols = code_parser.parse_file(entry.abs_path, entry.language, entry.rel_path)
-                    if not symbols:
-                        progress.advance(task)
-                        continue
-                    try:
-                        source = entry.abs_path.read_text(encoding="utf-8", errors="replace")
-                    except Exception:
-                        source = None
-                    file_chunks = chunker.chunk(symbols, entry.file_hash, full_source=source)
-                else:
-                    progress.advance(task)
-                    continue
-
-                all_chunks.extend(file_chunks)
-                progress.advance(task)
-
-        if not all_chunks:
-            console.print("[yellow]警告: 未生成任何代码切片[/yellow]")
-            tracker.update_tracker(repo_path, file_entries)
-            return
-
-        # 5. 生成 Embedding
-        with Progress(
-            SpinnerColumn(spinner_name="line"),
-            TextColumn("[progress.description]{task.description}"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(f"生成 Embedding ({len(all_chunks)} 个切片)...", total=None)
-            texts = [chunk.source for chunk in all_chunks]
-            all_embeddings = embedder.embed_texts(texts)
-            progress.update(task, description=f"Embedding 完成: {len(all_embeddings)} 个向量")
-
-        # 6. 写入 ChromaDB
-        with Progress(
-            SpinnerColumn(spinner_name="line"),
-            TextColumn("[progress.description]{task.description}"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("写入向量数据库...", total=None)
-            store.upsert_chunks(collection_name, all_chunks, all_embeddings)
-            progress.update(task, description="写入完成")
-
-        # 7. 更新追踪记录
-        tracker.update_tracker(repo_path, file_entries)
-
-        console.print(
-            f"[bold green][OK] 索引完成！[/bold green] "
-            f"处理 {len(files_to_process)} 个文件，生成 {len(all_chunks)} 个切片"
+        resolved = resolve_repo(source, ref=ref, settings=settings)
+        manifest_service.update_manifest(
+            repo_path=resolved,
+            file_count=result.scanned_files,
+            chunk_count=int(stats.get("total_chunks", 0)),
+            chunk_types=stats.get("chunk_types", {}),
+            resolved=resolved,
         )
 
+        _print_index_result(result)
+        console.print(
+            f"[bold green][OK] 索引完成！[/bold green] "
+            f"处理 {result.added + result.modified} 个文件，"
+            f"生成 {result.chunks_generated} 个切片"
+        )
+
+    except FileNotFoundError as exc:
+        console.print(f"[red]错误：{exc}[/red]")
+        raise typer.Exit(1) from None
+    except NotADirectoryError as exc:
+        console.print(f"[red]错误：{exc}[/red]")
+        raise typer.Exit(1) from None
+    except GitRepositoryError as exc:
+        console.print(f"[red]Git 错误：{exc}[/red]")
+        raise typer.Exit(1) from None
     except Exception as exc:
         console.print(f"[red]错误: {exc}[/red]")
         if verbose:
             console.print_exception()
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
 
 @app.command()
 def ask(
-    repo_path: Path = typer.Argument(..., help="代码仓库路径"),
+    source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
     question: str = typer.Argument(..., help="你的问题"),
+    ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
-    """对已索引的代码仓库提问。"""
+    """对已索引的代码仓库提问。支持本地路径与 Git URL。"""
     setup_logging(verbose)
-    repo_path = repo_path.resolve()
-
     console.print(f"[bold blue]>> 正在检索: {question}[/bold blue]")
 
     try:
         settings = get_settings()
+        service = QueryService(settings)
 
-        # 检索
         with Progress(
             SpinnerColumn(spinner_name="line"),
             TextColumn("[progress.description]{task.description}"),
@@ -235,54 +182,56 @@ def ask(
             console=console,
         ) as progress:
             task = progress.add_task("检索相关代码...", total=None)
-            retriever = Retriever(settings)
-            result = retriever.retrieve_with_context(question, repo_path)
-            progress.update(task, description=f"检索到 {len(result.chunks)} 个相关片段")
+            result = service.ask(question, source, ref=ref)
+            progress.update(task, description=f"检索到 {len(result.retrieval.chunks)} 个相关片段")
 
-        if not result.context:
+        if not result.retrieval.context:
             console.print("[yellow]未找到相关代码，请确认仓库已索引[/yellow]")
             return
 
-        # 生成回答（流式输出）
+        if result.low_confidence:
+            console.print(f"[yellow]提示: 检索置信度偏低 — {result.reason}[/yellow]")
+
         console.print("\n[bold]>> 回答：[/bold]\n")
         llm = LLMClient(settings)
-        for chunk in llm.generate_stream(result.context, question):
+        for chunk in llm.generate_stream(result.retrieval.context, question):
             console.print(chunk.content, end="")
 
         console.print("\n")
 
     except ValueError as exc:
         console.print(f"[red]配置错误: {exc}[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
     except RuntimeError as exc:
         console.print(f"[red]LLM 调用失败: {exc}[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
+    except FileNotFoundError as exc:
+        console.print(f"[red]错误：{exc}[/red]")
+        raise typer.Exit(1) from None
     except Exception as exc:
         console.print(f"[red]错误: {exc}[/red]")
         if verbose:
             console.print_exception()
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
 
 @app.command()
 def chat(
-    repo_path: Path = typer.Argument(..., help="代码仓库路径"),
+    source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
+    ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
-    """进入交互式对话模式。"""
+    """进入交互式对话模式。支持本地路径与 Git URL。"""
     setup_logging(verbose)
-    repo_path = repo_path.resolve()
-
-    console.print(f"[bold blue]>> 进入交互模式 — 仓库: {repo_path}[/bold blue]")
+    console.print(f"[bold blue]>> 进入交互模式 — 仓库: {source}[/bold blue]")
     console.print("[dim]输入 'exit' 或 'quit' 退出[/dim]\n")
 
     try:
         settings = get_settings()
-        retriever = Retriever(settings)
-        llm = LLMClient(settings)
+        service = QueryService(settings)
     except Exception as exc:
         console.print(f"[red]初始化失败: {exc}[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
 
     while True:
         try:
@@ -293,16 +242,15 @@ def chat(
             if not question.strip():
                 continue
 
-            # 检索
-            result = retriever.retrieve_with_context(question, repo_path)
+            result = service.ask(question, source, ref=ref)
 
-            if not result.context:
+            if not result.retrieval.context:
                 console.print("[yellow]未找到相关代码[/yellow]\n")
                 continue
 
-            # 流式生成
             console.print()
-            for chunk in llm.generate_stream(result.context, question):
+            llm = LLMClient(settings)
+            for chunk in llm.generate_stream(result.retrieval.context, question):
                 console.print(chunk.content, end="")
             console.print("\n")
 
@@ -320,147 +268,513 @@ def chat(
 def list_repos() -> None:
     """列出所有已索引的代码仓库。"""
     settings = get_settings()
+    service = ManifestService(settings)
+    entries = service.list_manifests()
 
-    # 遍历 indexes 目录
-    indexes_dir = settings.index_tracker_path
-    if not indexes_dir.exists():
+    if not entries:
         console.print("[dim]暂无已索引的仓库[/dim]")
         return
 
-    repos = []
-    for hash_dir in indexes_dir.iterdir():
-        tracker_file = hash_dir / "tracker.json"
-        if tracker_file.is_file():
-            import json
+    table = Table(title="已索引的仓库", show_header=True, header_style="bold")
+    table.add_column("类型", style="cyan", no_wrap=True)
+    table.add_column("来源", style="bold")
+    table.add_column("Ref", style="green")
+    table.add_column("文件", justify="right")
+    table.add_column("切片", justify="right")
+    table.add_column("最后索引", style="dim")
 
-            try:
-                data = json.loads(tracker_file.read_text(encoding="utf-8"))
-                repos.append((hash_dir.name, len(data)))
-            except Exception:
-                continue
-
-    if not repos:
-        console.print("[dim]暂无已索引的仓库[/dim]")
-        return
-
-    console.print("[bold blue]>> 已索引的仓库：[/bold blue]")
-    for hash_name, file_count in repos:
-        console.print(f"  - {hash_name} ({file_count} 个文件)")
+    for entry in entries:
+        ref = entry.ref or "-"
+        src = entry.canonical_source or entry.repo_path
+        if entry.source_type == "git":
+            display = src if len(src) <= 60 else "..." + src[-57:]
+        else:
+            display = entry.repo_path
+        table.add_row(
+            entry.source_type,
+            display,
+            ref,
+            str(entry.file_count),
+            str(entry.chunk_count),
+            entry.last_indexed_at,
+        )
+    console.print(table)
 
 
 @app.command()
 def status(
-    repo_path: Path = typer.Argument(..., help="代码仓库路径"),
+    source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
+    ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
 ) -> None:
-    """查看仓库的索引状态。"""
-    repo_path = repo_path.resolve()
-    console.print(f"[bold blue]>> 仓库索引状态: {repo_path}[/bold blue]")
+    """查看仓库的索引状态。支持本地路径与 Git URL。"""
+    console.print(f"[bold blue]>> 仓库索引状态: {source}[/bold blue]")
 
     settings = get_settings()
-    store = store_mod.ChromaStore(settings)
-    collection_name = store_mod.ChromaStore.get_collection_name(repo_path)
+    service = ManifestService(settings)
+    manifest, store_stats = service.get_status(source, ref=ref)
 
-    # 向量库统计
-    stats = store.get_stats(collection_name)
-    if not stats.get("exists"):
+    if not store_stats.get("exists"):
         console.print("[yellow]该仓库尚未索引[/yellow]")
         return
 
-    console.print(f"  仓库路径: {repo_path}")
-    console.print(f"  Collection: {collection_name}")
-    console.print(f"  总切片数: {stats['total_chunks']}")
+    if manifest:
+        console.print(f"  类型: {manifest.source_type}")
+        console.print(f"  来源: {manifest.canonical_source or manifest.repo_path}")
+        if manifest.display_name:
+            console.print(f"  名称: {manifest.display_name}")
+        if manifest.ref:
+            console.print(f"  Ref: {manifest.ref}")
+        if manifest.commit:
+            console.print(f"  Commit: {manifest.commit}")
+        if manifest.cache_path:
+            console.print(f"  缓存目录: {manifest.cache_path}")
+        console.print(f"  本地路径: {manifest.repo_path}")
+        console.print(f"  Collection: {manifest.collection_name}")
+        console.print(f"  最后索引: {manifest.last_indexed_at}")
+        console.print(f"  Embedding 模型: {manifest.embedding_model}")
+        console.print(f"  LLM 模型: {manifest.llm_model}")
+        console.print(f"  Tracker 文件数: {manifest.file_count}")
+        console.print(f"  检索 top_k: {manifest.retrieval_top_k}")
+        console.print(f"  检索阈值: {manifest.retrieval_score_threshold}")
+    console.print(f"  ChromaDB 总切片数: {store_stats['total_chunks']}")
 
-    if stats.get("chunk_types"):
+    types_to_show = (manifest.chunk_types if manifest else store_stats.get("chunk_types", {})) or {}
+    if types_to_show:
         console.print("  切片类型分布:")
-        for ctype, count in stats["chunk_types"].items():
+        for ctype, count in types_to_show.items():
             console.print(f"    - {ctype}: {count}")
 
 
 @app.command()
 def remove(
-    repo_path: Path = typer.Argument(..., help="代码仓库路径"),
+    source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
+    ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
     confirm: bool = typer.Option(False, "--yes", "-y", help="跳过确认"),
+    with_cache: bool = typer.Option(
+        False,
+        "--with-cache",
+        help="同时删除远程仓库缓存（仅 git URL 生效）",
+    ),
 ) -> None:
-    """删除仓库的索引数据。"""
-    repo_path = repo_path.resolve()
-
+    """删除仓库的索引数据（默认不删除远程仓库缓存）。"""
     if not confirm:
-        confirmed = typer.confirm(f"确定要删除 {repo_path} 的索引数据吗？")
+        confirmed = typer.confirm(f"确定要删除 {source} 的索引数据吗？")
         if not confirmed:
             console.print("[dim]已取消[/dim]")
             return
 
     settings = get_settings()
     store = store_mod.ChromaStore(settings)
-    collection_name = store_mod.ChromaStore.get_collection_name(repo_path)
+    manifest_service = ManifestService(settings)
+
+    # 解析为 ResolvedRepo，再得到 collection name
+    resolved = resolve_repo(source, ref=ref, settings=settings)
+    collection_name = store_mod.ChromaStore.get_collection_name_from_key(
+        resolved.identity.collection_key
+    )
 
     # 删除 ChromaDB collection
     store.delete_collection(collection_name)
 
-    # 删除 tracker 文件
-    hash_suffix = collection_name.replace("code-rag-", "")
-    tracker_path = settings.index_tracker_path / hash_suffix
+    # 删除 tracker 目录
     import shutil
 
-    if tracker_path.exists():
-        shutil.rmtree(tracker_path)
+    tracker_dir = settings.index_tracker_path / resolved.identity.collection_key
+    if tracker_dir.exists():
+        shutil.rmtree(tracker_dir, ignore_errors=True)
 
-    console.print(f"[bold green][OK] 已删除 {repo_path} 的索引数据[/bold green]")
+    # 兼容老实现：单文件 manifest 路径的清理
+    manifest_service.remove_manifest(resolved)
+
+    # 可选：同时删除缓存
+    if with_cache and resolved.cache_path is not None:
+        cache = CacheManager(settings.repo_cache_dir)
+        cache.remove(resolved.identity.canonical_source)
+        console.print(f"[dim]已同时删除远程仓库缓存: {resolved.cache_path}[/dim]")
+
+    console.print(f"[bold green][OK] 已删除 {source} 的索引数据[/bold green]")
 
 
 @app.command()
 def search(
-    repo_path: Path = typer.Argument(..., help="代码仓库路径"),
+    source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
     query: str = typer.Argument(..., help="检索查询"),
     top_k: int = typer.Option(8, "--top-k", "-k", help="最大返回结果数"),
+    mode: str = typer.Option(
+        "vector",
+        "--mode",
+        "-m",
+        help="检索模式: vector / lexical / hybrid",
+    ),
+    ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    explain: bool = typer.Option(False, "--explain", help="显示每条结果来自哪个检索阶段和耗时"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
-    """调试检索：只显示召回结果，不调用 LLM。"""
+    """调试检索：只显示召回结果，不调用 LLM。支持本地路径与 Git URL。"""
     setup_logging(verbose)
-    repo_path = repo_path.resolve()
-
     console.print(f"[bold blue]>> 检索调试: {query}[/bold blue]")
 
     try:
         settings = get_settings()
-
-        # 检查 collection 是否存在
+        resolved = resolve_repo(source, ref=ref, settings=settings)
         store = store_mod.ChromaStore(settings)
-        coll_name = store_mod.ChromaStore.get_collection_name(repo_path)
+        coll_name = store_mod.ChromaStore.get_collection_name_from_key(
+            resolved.identity.collection_key
+        )
         stats = store.get_stats(coll_name)
 
         if not stats["exists"]:
             console.print("[yellow]该仓库尚未索引，请先运行 index 命令[/yellow]")
             raise typer.Exit(0)
 
-        # 执行检索
-        retriever = Retriever(settings)
-        results = retriever.retrieve(query, repo_path, top_k=top_k)
+        # 选择检索模式
+        if mode == "vector":
+            retriever = Retriever(settings)
+            results = retriever.retrieve(query, resolved, top_k=top_k)
+            stage_label = "vector"
+        elif mode == "lexical":
+            from code_rag.retriever.lexical import LexicalRetriever
+
+            lex = LexicalRetriever(store, resolved)
+            results = lex.search(query, top_k=top_k)
+            stage_label = "lexical"
+        elif mode == "hybrid":
+            from code_rag.retriever.hybrid import HybridRetriever
+            from code_rag.retriever.lexical import LexicalRetriever
+            from code_rag.retriever.rerank import RRFReranker
+
+            base = Retriever(settings)
+            lex = LexicalRetriever(store, resolved)
+            hybrid = HybridRetriever(
+                vector_retriever=base,
+                lexical_retriever=lex,
+                reranker=RRFReranker(),
+            )
+            results = hybrid.search(query, resolved, top_k=top_k)
+            stage_label = "hybrid"
+        else:
+            console.print(f"[red]不支持的检索模式: {mode}（应为 vector/lexical/hybrid）[/red]")
+            raise typer.Exit(1)
 
         if not results:
             console.print("[yellow]未检索到任何结果[/yellow]")
             raise typer.Exit(0)
 
         # 输出结果
-        console.print(f"\n[bold]检索到 {len(results)} 条结果:[/bold]\n")
+        console.print(f"\n[bold]检索到 {len(results)} 条结果[/bold] (mode={stage_label})\n")
         for i, result in enumerate(results, 1):
             chunk = result.chunk
-            console.print(
+            extras = []
+            if explain:
+                stage = getattr(result, "stage", stage_label)
+                extras.append(f"stage={stage}")
+            extra_str = "  ".join(extras)
+            line = (
                 f"  [{i}] score={result.score:.4f}  "
                 f"type={chunk.chunk_type}  "
                 f"name={chunk.name}  "
                 f"file={chunk.file_path}  "
                 f"lines={chunk.start_line}-{chunk.end_line}"
             )
+            if extra_str:
+                line += f"  ({extra_str})"
+            console.print(line)
             if chunk.parent:
                 console.print(f"      parent={chunk.parent}")
         console.print()
 
+    except FileNotFoundError as exc:
+        console.print(f"[red]错误：{exc}[/red]")
+        raise typer.Exit(1) from None
+    except GitRepositoryError as exc:
+        console.print(f"[red]Git 错误：{exc}[/red]")
+        raise typer.Exit(1) from None
     except Exception as exc:
         console.print(f"[red]错误: {exc}[/red]")
         if verbose:
             console.print_exception()
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
+
+
+@app.command()
+def eval(
+    source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
+    dataset: Path = typer.Option(
+        "evals/code_rag_golden.yaml",
+        "--dataset",
+        "-d",
+        help="Golden query 数据集 YAML 路径",
+    ),
+    top_k: int = typer.Option(8, "--top-k", "-k", help="检索 top_k"),
+    mode: str = typer.Option(
+        "vector",
+        "--mode",
+        "-m",
+        help="检索模式: vector / lexical / hybrid",
+    ),
+    ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="JSON 报告输出路径"),
+    markdown: Path | None = typer.Option(None, "--markdown", help="Markdown 报告输出路径"),
+) -> None:
+    """对 golden query 数据集运行检索评测（不调用 LLM）。"""
+    try:
+        from code_rag.services import EvalService
+    except ImportError as exc:
+        console.print(f"[red]无法加载 EvalService: {exc}[/red]")
+        raise typer.Exit(1) from None
+
+    settings = get_settings()
+    service = EvalService(settings)
+
+    console.print("[bold blue]>> 检索评测[/bold blue]")
+    console.print(f"  仓库: {source}")
+    console.print(f"  数据集: {dataset}")
+    console.print(f"  top_k: {top_k}, mode: {mode}")
+
+    try:
+        ds = service.load(dataset)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from None
+
+    if not ds.queries:
+        console.print("[yellow]数据集为空[/yellow]")
+        return
+
+    console.print(f"  loaded: {len(ds.queries)} 条 golden query")
+
+    with Progress(
+        SpinnerColumn(spinner_name="line"),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("评测中...", total=None)
+        summary = service.run(
+            ds,
+            repo_path=source,
+            top_k=top_k,
+            mode=mode,
+            ref=ref,
+        )
+        progress.update(task, description="评测完成")
+
+    # 输出概览
+    console.print(
+        f"\n  [bold]Recall@1={summary.recall_at_1:.2%}  "
+        f"Recall@3={summary.recall_at_3:.2%}  "
+        f"Recall@8={summary.recall_at_8:.2%}  "
+        f"MRR={summary.mrr:.4f}[/bold]"
+    )
+    console.print(
+        f"  file_hit={summary.file_hit_rate:.2%}  "
+        f"symbol_hit={summary.symbol_hit_rate:.2%}  "
+        f"avg_latency={summary.avg_latency_ms:.1f}ms"
+    )
+
+    # 失败样例
+    failed = [
+        q
+        for q in summary.per_query
+        if q.has_expected_target and not q.file_hit and not q.symbol_hit
+    ]
+    if failed:
+        console.print(f"\n  [yellow]未命中样例 ({len(failed)}):[/yellow]")
+        for q in failed[:5]:
+            console.print(f"    - {q.query_id}: {q.question}")
+
+    # 写报告
+    json_path = str(output) if output else None
+    md_path = str(markdown) if markdown else None
+    if json_path or md_path:
+        paths = service.write_reports(
+            summary,
+            dataset_name=ds.name,
+            repo_path=str(source),
+            top_k=top_k,
+            mode=mode,
+            output_json=json_path,
+            output_markdown=md_path,
+        )
+        if paths.json_path:
+            console.print(f"  JSON 报告: {paths.json_path}")
+        if paths.markdown_path:
+            console.print(f"  Markdown 报告: {paths.markdown_path}")
+
+
+# ---------------------------------------------------------------------------
+# agent 子命令 — 轻量 Code Agent（只读分析 / 修改计划）
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def agent(
+    source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
+    task: str = typer.Argument(..., help="Agent 任务描述（自然语言）"),
+    ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    plan_only: bool = typer.Option(
+        True,
+        "--plan-only/--no-plan-only",
+        help="只生成修改计划（默认开启，不调用 LLM 也不修改文件）",
+    ),
+    top_k: int = typer.Option(5, "--top-k", "-k", help="每个子问题的检索条数"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
+) -> None:
+    """轻量 Code Agent：拆解任务 → 检索 → 汇总计划（只读）。"""
+    setup_logging(verbose)
+    console.print(f"[bold blue]>> Agent 任务: {task}[/bold blue]")
+    console.print(f"[dim]仓库: {source}{(' @ ' + ref) if ref else ''}[/dim]")
+
+    try:
+        settings = get_settings()
+        resolved = resolve_repo(source, ref=ref, settings=settings)
+        from code_rag.agent import AgentTask, CodeAgent
+
+        agent_obj = CodeAgent(settings=settings)
+        report = agent_obj.run(AgentTask(task=task, resolved=resolved, plan_only=plan_only))
+    except FileNotFoundError as exc:
+        console.print(f"[red]错误：{exc}[/red]")
+        raise typer.Exit(1) from None
+    except GitRepositoryError as exc:
+        console.print(f"[red]Git 错误：{exc}[/red]")
+        raise typer.Exit(1) from None
+    except Exception as exc:
+        console.print(f"[red]错误: {exc}[/red]")
+        if verbose:
+            console.print_exception()
+        raise typer.Exit(1) from None
+
+    # 渲染报告
+    _print_agent_report(report, top_k=top_k)
+
+
+def _print_agent_report(report, top_k: int = 5) -> None:  # type: ignore[no-untyped-def]
+    """Rich 渲染 :class:`AgentReport`。"""
+    console.print("\n[bold]>> 任务理解[/bold]")
+    console.print(f"  {report.understanding}")
+
+    console.print("\n[bold]>> 计划拆解[/bold]")
+    for i, step in enumerate(report.plan.steps, 1):
+        console.print(f"  {i}. {step.question}")
+        if step.rationale:
+            console.print(f"     [dim]理由: {step.rationale}[/dim]")
+
+    console.print("\n[bold]>> 关键文件[/bold]")
+    if report.key_files:
+        for fp in report.key_files:
+            console.print(f"  - {fp}")
+    else:
+        console.print("  [dim](无)[/dim]")
+
+    console.print("\n[bold]>> 修改建议（只读，不会自动应用）[/bold]")
+    for change in report.suggested_changes:
+        console.print(f"  - {change}")
+
+    if report.risks:
+        console.print("\n[bold]>> 风险点[/bold]")
+        for risk in report.risks:
+            console.print(f"  - {risk}")
+
+    if report.suggested_tests:
+        console.print("\n[bold]>> 建议运行的测试[/bold]")
+        for test in report.suggested_tests:
+            console.print(f"  - {test}")
+
+    if report.references:
+        console.print(f"\n[bold]>> 引用证据（最多 {top_k} 条/子问题）[/bold]")
+        for ref in report.references[: top_k * max(1, len(report.plan.steps))]:
+            console.print(f"  - {ref}")
+
+    if report.insufficient_evidence:
+        console.print("\n[yellow][!] 证据不足：请确认仓库已索引或补充任务描述[/yellow]")
+    if report.review_note:
+        console.print(f"\n[dim]Reviewer: {report.review_note}[/dim]")
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# cache 子命令
+# ---------------------------------------------------------------------------
+
+
+@cache_app.command("list")
+def cache_list() -> None:
+    """列出所有缓存的远程仓库。"""
+    settings = get_settings()
+    cache = CacheManager(settings.repo_cache_dir)
+    entries = cache.list_entries()
+
+    if not entries:
+        console.print(f"[dim]无远程仓库缓存（根目录：{settings.repo_cache_path}）[/dim]")
+        return
+
+    table = Table(
+        title=f"远程仓库缓存（{settings.repo_cache_path}）",
+        show_header=True,
+        header_style="bold",
+    )
+    table.add_column("URL", style="bold")
+    table.add_column("Ref", style="green")
+    table.add_column("Commit", style="dim")
+    table.add_column("更新时间", style="dim")
+
+    for entry in entries:
+        url = entry.canonical_url
+        if len(url) > 60:
+            url = "..." + url[-57:]
+        table.add_row(
+            url,
+            entry.ref or "-",
+            (entry.commit or "-")[:12],
+            entry.updated_at or "-",
+        )
+    console.print(table)
+
+
+@cache_app.command("prune")
+def cache_prune(
+    confirm: bool = typer.Option(False, "--yes", "-y", help="跳过确认"),
+) -> None:
+    """清理所有远程仓库缓存。"""
+    settings = get_settings()
+    cache = CacheManager(settings.repo_cache_dir)
+    entries = cache.list_entries()
+
+    if not entries:
+        console.print("[dim]无远程仓库缓存，无需清理[/dim]")
+        return
+
+    if not confirm:
+        confirmed = typer.confirm(f"将删除 {len(entries)} 个远程仓库缓存，确定？")
+        if not confirmed:
+            console.print("[dim]已取消[/dim]")
+            return
+
+    removed = cache.prune()
+    console.print(f"[bold green][OK] 已清理 {len(removed)} 个远程仓库缓存[/bold green]")
+
+
+# ---------------------------------------------------------------------------
+# 内部：展示索引结果
+# ---------------------------------------------------------------------------
+
+
+def _print_index_result(result) -> None:  # type: ignore[no-untyped-def]
+    """打印索引结果摘要，对 git 仓库展示额外信息。"""
+    if result.source_type == "git":
+        console.print("  [cyan]类型[/cyan]: git")
+        console.print(f"  [cyan]URL[/cyan]: {result.canonical_source}")
+        if result.ref:
+            console.print(f"  [cyan]Ref[/cyan]: {result.ref}")
+        if result.commit:
+            console.print(f"  [cyan]Commit[/cyan]: {result.commit}")
+        if result.cache_path:
+            console.print(f"  [cyan]缓存目录[/cyan]: {result.cache_path}")
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":

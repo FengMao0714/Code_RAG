@@ -36,6 +36,8 @@ dependencies = [
     "gitpython>=3.1",
     # Token 计数
     "tiktoken>=0.7",
+    # YAML (golden query dataset)
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

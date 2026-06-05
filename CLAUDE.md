@@ -12,7 +12,7 @@ Code_RAG 是一个 **代码知识库 RAG 问答助手**，CLI 工具，帮助用
 
 - **Python 3.11+**，包管理使用 `uv`
 - **CLI**：`typer` + `rich`
-- **代码解析**：`tree-sitter` + `tree-sitter-languages`
+- **代码解析**：`tree-sitter` + 各语言独立 grammar 包（如 `tree-sitter-python`）
 - **向量数据库**：`ChromaDB`（本地持久化）
 - **Embedding**：`sentence-transformers` + `BAAI/bge-large-zh-v1.5`（本地模型）
 - **LLM**：通过 OpenAI 兼容接口调用在线 API（默认 MiMo-7B-RL）
@@ -32,13 +32,36 @@ src/code_rag/
 ├── store/
 │   ├── vector_store.py  # ChromaDB 封装（CRUD + upsert）
 │   └── index_tracker.py # 增量更新追踪（文件哈希对比）
+├── repository/          # 仓库源抽象（本地路径 / Git URL）
+│   ├── models.py        # RepoSource / RepoIdentity / ResolvedRepo
+│   ├── parser.py        # 本地路径 / Git URL 解析
+│   ├── local.py         # 本地路径 provider
+│   ├── git.py           # Git clone / fetch / checkout
+│   ├── cache.py         # 远程仓库缓存目录
+│   └── resolver.py      # resolve_repo 统一入口
 ├── retriever/
-│   └── retriever.py     # 向量检索 + 上下文组装
+│   ├── retriever.py     # 向量检索 + metadata boost + 上下文组装
+│   ├── lexical.py       # 词法检索（符号/文件/源码子串）
+│   ├── rerank.py        # RRF 重排序（k=60，通道权重）
+│   └── hybrid.py        # 向量 + 词法 + RRF 融合
 ├── generator/
 │   ├── llm.py           # LLM 调用封装 (OpenAI SDK)
 │   └── prompts.py       # System/User Prompt 模板
+├── services/            # 业务编排层（CLI 不再做业务）
+│   ├── index_service.py
+│   ├── query_service.py
+│   ├── manifest_service.py
+│   └── eval_service.py
+├── evaluation/          # 检索评测
+│   ├── dataset.py
+│   ├── metrics.py
+│   └── report.py
+├── agent/               # 轻量 Code Agent（只读）
+│   ├── models.py
+│   ├── planner.py
+│   └── code_agent.py
 └── utils/
-    └── file_utils.py    # 文件读写、路径处理等工具函数
+    └── __init__.py      # 预留工具包
 ```
 
 ## 编码规范
@@ -107,12 +130,18 @@ src/code_rag/
 
 ### CLI 命令（cli.py）
 ```bash
-code-rag index <repo_path>         # 索引（增量）
-code-rag ask <repo_path> "<question>"  # 单次问答
-code-rag chat <repo_path>          # 交互模式
-code-rag list                      # 列出已索引仓库
-code-rag status <repo_path>        # 索引状态
-code-rag remove <repo_path>        # 删除索引
+# 同一组命令同时接受本地路径与 Git 仓库 URL
+code-rag index  <source> [--ref <git-ref>] [--refresh]   # 索引（增量）
+code-rag ask    <source> "<question>"  [--ref <git-ref>]  # 单次问答
+code-rag chat   <source> [--ref <git-ref>]               # 交互模式
+code-rag search <source> "<question>"                    # 检索调试（不调用 LLM）
+code-rag list                                            # 列出已索引仓库
+code-rag status <source> [--ref <git-ref>]               # 索引状态
+code-rag remove <source> --yes [--with-cache]            # 删除索引（可选同步删远程缓存）
+code-rag eval   <source> --dataset <yaml> [--mode ...]   # 检索评测（不调用 LLM）
+code-rag agent  <source> "<task>" [--plan-only]          # 轻量 Code Agent（只读）
+code-rag cache list                                      # 列出所有远程仓库缓存
+code-rag cache prune --yes                               # 清理所有远程仓库缓存
 ```
 
 ## 开发命令
@@ -125,11 +154,11 @@ uv sync
 uv run code-rag --help
 
 # 测试
-uv run pytest tests/ -v
+uv run --frozen pytest tests/ -v
 
 # 代码检查
-uv run ruff check src/
-uv run ruff format src/
+uv run --frozen ruff check src/ tests/
+uv run --frozen ruff format --check src/ tests/
 ```
 
 ## 重要提醒
@@ -138,3 +167,149 @@ uv run ruff format src/
 2. 每次修改代码后，确保 `uv run ruff check src/` 通过
 3. 新增模块/函数时，同步更新对应的测试文件
 4. Embedding 模型是本地运行的，首次使用会自动下载（约 1.3GB）
+
+## AI/RAG 简历优化重构规则
+
+本项目当前目标是把已有 Code_RAG 打磨成适合 AI/RAG 实习简历展示的工程项目。不要把任务理解成从零重写，也不要为了炫技引入偏离主线的大型框架。
+
+### 执行原则
+
+1. 先阅读真实代码、测试、README、PROJECT_STATUS，再开始修改。
+2. 以真实代码为准；如果文档与代码不一致，修正文档或在实现中保持向后兼容。
+3. 保留现有 CLI RAG 闭环：`index -> search/ask/chat -> status/list/remove`。
+4. 不要大规模推倒重写核心链路，优先做分层、评测、检索增强和展示打磨。
+5. 不要新增 Web UI、FastAPI 或前端页面，除非用户重新明确要求。
+6. 不要让测试依赖真实网络、真实 LLM API 或模型下载。
+7. 不要提交 `.env`、API Key、本地 ChromaDB 数据、模型缓存和临时 debug 文件。
+8. 若需要新增依赖，必须说明原因，并保持 `uv run --frozen` 可复现。
+
+### 重构优先级
+
+最高优先级：
+
+1. 服务层重构：把 `cli.py` 的业务编排拆到 `services/`，CLI 只负责参数解析和 Rich 展示。
+2. 仓库 Manifest：记录真实仓库路径、collection、最后索引时间、文件数、chunk 数、模型和关键配置。
+3. Hybrid Retrieval：在现有向量检索和 metadata boost 基础上，增加符号/文件名词法召回，并用 RRF 融合排序。
+4. Retrieval Eval：增加 golden query 数据集、Recall@k、MRR、JSON/Markdown 报告和 `code-rag eval` 命令。
+5. README 展示：补充架构、评测结果、核心亮点、演示命令和可直接写进简历的项目描述。
+
+中等优先级：
+
+1. `search --explain` 展示 vector、lexical、rerank 的命中来源和阶段耗时。
+2. 低置信度策略：无证据或弱证据时明确提示，不诱导 LLM 硬答。
+3. GitHub Actions：至少运行 ruff check、format check、pytest。
+
+低优先级：
+
+1. Web/API/UI。
+2. 替换 ChromaDB 或 embedding 模型。
+3. 无明确收益的复杂设计模式。
+
+### 推荐新增模块
+
+```text
+src/code_rag/services/
+├── __init__.py
+├── index_service.py
+├── query_service.py
+└── eval_service.py
+
+src/code_rag/evaluation/
+├── __init__.py
+├── dataset.py
+├── metrics.py
+└── report.py
+
+src/code_rag/retriever/
+├── lexical.py
+└── rerank.py
+
+src/code_rag/store/
+└── manifest.py
+
+evals/
+└── code_rag_golden.yaml
+```
+
+### 推荐公开命令
+
+```bash
+uv run code-rag search . "CLI 入口在哪里" --mode hybrid --explain
+uv run code-rag search . "CLI 入口在哪里" --mode vector
+uv run code-rag search . "CLI 入口在哪里" --mode lexical
+uv run code-rag eval . --dataset evals/code_rag_golden.yaml --top-k 8
+uv run code-rag eval . --dataset evals/code_rag_golden.yaml --output reports/eval_latest.json --markdown reports/eval_latest.md
+```
+
+### Golden Query 要求
+
+`evals/code_rag_golden.yaml` 至少包含 10 条问题，覆盖：
+
+1. 符号定位：CLI 入口在哪里。
+2. 配置定位：项目脚本入口在哪里定义。
+3. scanner 如何过滤文件。
+4. 增量索引如何判断 added/modified/deleted。
+5. chunker 如何处理超长函数。
+6. retriever 如何做 metadata boost。
+7. ChromaDB 如何 upsert 和 query。
+8. LLM 流式输出在哪里实现。
+9. 负样本：项目是否实现了 Web UI。
+10. 歧义样本：`list`、`status`、`remove` 各自做什么。
+
+每条 golden query 应包含：
+
+```yaml
+- id: cli_entry
+  question: CLI 入口在哪里？
+  expected_files:
+    - src/code_rag/cli.py
+    - pyproject.toml
+  expected_symbols:
+    - app
+```
+
+### 评测指标
+
+Retrieval eval 至少输出：
+
+- Recall@1
+- Recall@3
+- Recall@8
+- MRR
+- expected file hit
+- expected symbol hit
+- 每条 query 的检索耗时
+- 每条失败样例的命中文件和排名
+
+`eval` 命令不得调用 LLM，只评估 retrieval。
+
+### 最终验收命令
+
+每个阶段结束后必须运行：
+
+```bash
+uv run --frozen pytest -q
+uv run --frozen ruff check src/ tests/
+uv run --frozen ruff format --check src/ tests/
+```
+
+最终还必须运行：
+
+```bash
+uv run code-rag eval . --dataset evals/code_rag_golden.yaml --top-k 8
+```
+
+### 最终交付说明
+
+完成重构后，必须给出：
+
+1. 改动摘要。
+2. 新增文件和模块。
+3. 新增测试与评测数据集。
+4. 所有验证命令结果。
+5. Retrieval eval 指标摘要。
+6. README 中可用于简历的一句话项目描述。
+
+### 推荐简历表达
+
+开发代码仓库 RAG 问答 CLI，基于 tree-sitter 实现 14 种语言 AST 语义切片，结合 BGE Embedding、ChromaDB、符号词法索引与 RRF 混合召回，支持增量索引、流式问答和可复现检索评测；构建 golden query 评测集统计 Recall@k/MRR，并通过 100+ 自动化测试和 Windows/Linux CI 保障质量。

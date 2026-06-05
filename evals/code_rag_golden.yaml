@@ -1,0 +1,135 @@
+# Golden Query 数据集 — Code_RAG 项目自评
+#
+# 每条问题覆盖一个核心概念：
+# - 符号定位
+# - 配置定位
+# - 流程解释
+# - 边界 / 负样本 / 歧义样本
+#
+# 注意：expected_files 中的相对路径均相对当前仓库根目录；
+# evaluator 会对这些路径做归一化（小写 + 反斜杠转斜杠）后比较。
+
+- id: cli_entry
+  category: symbol_location
+  difficulty: easy
+  question: CLI 入口在哪里？
+  expected_files:
+    - src/code_rag/cli.py
+    - pyproject.toml
+  expected_symbols:
+    - app
+
+- id: project_scripts
+  category: config_location
+  difficulty: easy
+  mode: lexical
+  question: pyproject.toml 中的 [project.scripts] 和 code-rag 入口是如何定义的？
+  expected_files:
+    - pyproject.toml
+  expected_symbols:
+    - scripts
+    - code-rag
+
+- id: scanner_filter
+  category: workflow
+  difficulty: medium
+  question: scanner 是如何过滤文件的？
+  expected_files:
+    - src/code_rag/indexer/scanner.py
+  expected_symbols:
+    - RepoScanner
+    - scan
+
+- id: incremental_diff
+  category: workflow
+  difficulty: medium
+  question: 增量索引如何判断 added/modified/deleted？
+  expected_files:
+    - src/code_rag/store/index_tracker.py
+  expected_symbols:
+    - IndexTracker
+    - get_changes
+    - update_tracker
+
+- id: long_function_chunking
+  category: workflow
+  difficulty: hard
+  question: chunker 如何处理超长函数？
+  expected_files:
+    - src/code_rag/indexer/chunker.py
+  expected_symbols:
+    - CodeChunker
+    - _split_oversized_function
+    - _find_split_point
+
+- id: metadata_boost
+  category: workflow
+  difficulty: medium
+  question: retriever 如何做 metadata boost？
+  expected_files:
+    - src/code_rag/retriever/retriever.py
+  expected_symbols:
+    - boost_by_metadata
+    - _extract_keywords
+
+- id: chroma_upsert
+  category: workflow
+  difficulty: medium
+  question: ChromaDB 如何 upsert 和 query？
+  expected_files:
+    - src/code_rag/store/vector_store.py
+  expected_symbols:
+    - upsert_chunks
+    - query
+
+- id: llm_streaming
+  category: workflow
+  difficulty: medium
+  question: LLM 流式输出在哪里实现？
+  expected_files:
+    - src/code_rag/generator/llm.py
+  expected_symbols:
+    - generate_stream
+    - LLMClient
+
+- id: web_ui_negative
+  category: negative
+  difficulty: easy
+  question: 这个项目是否实现了 Web UI 或 HTTP API？
+  expected_files: []
+  expected_symbols: []
+
+- id: list_status_remove
+  category: ambiguity
+  difficulty: easy
+  question: code-rag list、status、remove 各自做什么？
+  expected_files:
+    - src/code_rag/cli.py
+    - src/code_rag/services/manifest_service.py
+  expected_symbols:
+    - list_repos
+    - status
+    - remove
+    - ManifestService
+
+- id: hybrid_retrieval
+  category: workflow
+  difficulty: medium
+  question: 混合检索怎么把向量和词法召回融合？
+  expected_files:
+    - src/code_rag/retriever/hybrid.py
+    - src/code_rag/retriever/rerank.py
+  expected_symbols:
+    - HybridRetriever
+    - RRFReranker
+
+- id: eval_cli
+  category: workflow
+  difficulty: medium
+  question: 怎么跑检索评测？
+  expected_files:
+    - evals/code_rag_golden.yaml
+    - src/code_rag/services/eval_service.py
+  expected_symbols:
+    - EvalService
+    - code_rag_golden

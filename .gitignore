@@ -20,6 +20,7 @@ env/
 
 # Environment
 .env
+.env.local
 
 # ChromaDB local data
 .chroma/
@@ -28,8 +29,19 @@ chroma_data/
 # Code-RAG index data
 .code-rag/
 
+# Remote repository cache (git clones)
+repos/
+repo_cache/
+
+# Temp clone dirs
+tmp_clone/
+tmp_repo/
+tmp_remote/
+
 # Embedding model cache
 models/
+huggingface/
+hf_cache/
 
 # OS
 Thumbs.db
@@ -42,3 +54,7 @@ htmlcov/
 
 # UV
 uv.lock
+
+# Generated reports
+reports/
+.eval_outputs/

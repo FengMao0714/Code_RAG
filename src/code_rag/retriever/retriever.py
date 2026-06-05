@@ -19,9 +19,13 @@ from code_rag.config import Settings, get_settings
 from code_rag.generator.prompts import CONTEXT_CHUNK_TEMPLATE
 from code_rag.indexer.chunker import CodeChunk
 from code_rag.indexer.embedder import Embedder
+from code_rag.repository import ResolvedRepo
 from code_rag.store.vector_store import ChromaStore, SearchResult
 
 logger = logging.getLogger(__name__)
+
+
+RepoLike = str | Path | ResolvedRepo
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +169,7 @@ class Retriever:
     def retrieve(
         self,
         query: str,
-        repo_path: str | Path,
+        repo_path: RepoLike,
         *,
         top_k: int | None = None,
         score_threshold: float | None = None,
@@ -177,7 +181,7 @@ class Retriever:
 
         Args:
             query: 用户的查询文本。
-            repo_path: 仓库路径，用于确定 collection 名称。
+            repo_path: 仓库标识（``str | Path | ResolvedRepo``）。
             top_k: 返回的最大结果数；为 ``None`` 时使用配置值。
             score_threshold: 距离阈值，超过此值的结果将被过滤；
                 为 ``None`` 时使用配置值。
@@ -195,7 +199,7 @@ class Retriever:
             else self._settings.retrieval_score_threshold
         )
 
-        collection_name = ChromaStore.get_collection_name(repo_path)
+        collection_name = self._collection_name_for(repo_path)
         logger.info(
             "开始检索: query='%s', collection='%s', top_k=%d",
             query[:50],
@@ -243,7 +247,7 @@ class Retriever:
     def retrieve_with_context(
         self,
         query: str,
-        repo_path: str | Path,
+        repo_path: RepoLike,
         *,
         top_k: int | None = None,
         score_threshold: float | None = None,
@@ -254,7 +258,7 @@ class Retriever:
 
         Args:
             query: 用户的查询文本。
-            repo_path: 仓库路径。
+            repo_path: 仓库标识。
             top_k: 返回的最大结果数。
             score_threshold: 距离阈值。
 
@@ -281,6 +285,17 @@ class Retriever:
             context=context,
             scores=scores,
         )
+
+    @staticmethod
+    def _collection_name_for(repo: RepoLike) -> str:
+        """根据仓库标识计算 collection 名称。
+
+        - :class:`ResolvedRepo` → ``identity.collection_key``。
+        - ``Path`` / ``str`` → 旧行为（按绝对路径 SHA-256）以保持兼容。
+        """
+        if isinstance(repo, ResolvedRepo):
+            return ChromaStore.get_collection_name_from_key(repo.identity.collection_key)
+        return ChromaStore.get_collection_name(repo)
 
     # ---------------------------------------------------------------------------
     # 上下文组装器

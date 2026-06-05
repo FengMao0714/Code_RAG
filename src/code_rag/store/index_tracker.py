@@ -5,6 +5,10 @@
 
 追踪数据以 JSON 格式存储在 ``config.index_tracker_path`` 下，
 每个仓库对应独立的 ``tracker.json`` 文件。
+
+本模块支持 :class:`~code_rag.repository.ResolvedRepo` 与 ``str | Path``
+两种入参；前者用 ``identity.collection_key`` 作为 tracker 目录名，
+后者保留旧的"绝对路径 SHA-256" 行为以兼容历史 manifest。
 """
 
 from __future__ import annotations
@@ -17,11 +21,15 @@ from pathlib import Path
 
 from code_rag.config import Settings, get_settings
 from code_rag.indexer.scanner import FileEntry
+from code_rag.repository import ResolvedRepo
 
 logger = logging.getLogger(__name__)
 
 # tracker 文件名
 _TRACKER_FILENAME = "tracker.json"
+
+# tracker 入参类型：支持 ResolvedRepo 与 str/Path
+TrackerKey = str | Path | ResolvedRepo
 
 
 # ---------------------------------------------------------------------------
@@ -83,16 +91,12 @@ class IndexTracker:
     """
 
     def __init__(self, settings: Settings | None = None) -> None:
-        """初始化追踪器。
-
-        Args:
-            settings: 应用配置。
-        """
+        """初始化追踪器。"""
         self._settings = settings or get_settings()
 
     def get_changes(
         self,
-        repo_path: str | Path,
+        repo_path: TrackerKey,
         current_file_entries: list[FileEntry],
     ) -> ChangeSet:
         """对比当前扫描结果与已存储记录，计算文件变更。
@@ -101,7 +105,9 @@ class IndexTracker:
         记录的 SHA-256 哈希进行比对，将文件分为 added / modified / deleted。
 
         Args:
-            repo_path: 仓库路径。
+            repo_path: :class:`ResolvedRepo` 或 ``str | Path``。
+                - :class:`ResolvedRepo`: 使用 ``identity.collection_key`` 作为 tracker key。
+                - ``str | Path``: 兼容旧行为，使用绝对路径 SHA-256 哈希。
             current_file_entries: 当前扫描产出的文件条目列表。
 
         Returns:
@@ -118,6 +124,7 @@ class IndexTracker:
         added: list[FileEntry] = []
         modified: list[FileEntry] = []
         deleted: list[FileEntry] = []
+        deleted_root = self._resolve_abs_path(repo_path)
 
         # 遍历当前文件：识别 added / modified
         for rel_path, current_hash in current_hashes.items():
@@ -131,7 +138,7 @@ class IndexTracker:
             if rel_path not in current_hashes:
                 deleted.append(
                     FileEntry(
-                        abs_path=Path(repo_path) / rel_path,
+                        abs_path=deleted_root / rel_path,
                         rel_path=rel_path,
                         language=None,
                         extension=Path(rel_path).suffix.lower(),
@@ -150,7 +157,7 @@ class IndexTracker:
 
     def update_tracker(
         self,
-        repo_path: str | Path,
+        repo_path: TrackerKey,
         file_entries: list[FileEntry],
     ) -> None:
         """持久化当前文件哈希记录。
@@ -159,7 +166,7 @@ class IndexTracker:
         替换上一次的记录。
 
         Args:
-            repo_path: 仓库路径。
+            repo_path: 仓库标识（同 :meth:`get_changes`）。
             file_entries: 本次索引后的文件条目列表。
         """
         hashes = {entry.rel_path: entry.file_hash for entry in file_entries}
@@ -170,11 +177,11 @@ class IndexTracker:
     # 内部方法
     # ------------------------------------------------------------------
 
-    def _get_tracker_path(self, repo_path: str | Path) -> Path:
+    def _get_tracker_path(self, repo_path: TrackerKey) -> Path:
         """获取仓库对应的 tracker.json 文件路径。
 
         Args:
-            repo_path: 仓库路径。
+            repo_path: 仓库标识。
 
         Returns:
             ``{index_tracker_path}/{repo_hash}/tracker.json``。
@@ -182,13 +189,13 @@ class IndexTracker:
         repo_hash = self._hash_repo_path(repo_path)
         return self._settings.index_tracker_path / repo_hash / _TRACKER_FILENAME
 
-    def _load(self, repo_path: str | Path) -> dict[str, str]:
+    def _load(self, repo_path: TrackerKey) -> dict[str, str]:
         """从磁盘加载仓库的文件哈希记录。
 
         如果 tracker 文件不存在（首次索引），返回空字典。
 
         Args:
-            repo_path: 仓库路径。
+            repo_path: 仓库标识。
 
         Returns:
             ``{rel_path: sha256}`` 映射。
@@ -204,14 +211,13 @@ class IndexTracker:
             logger.warning("追踪文件读取失败，视为首次索引: %s — %s", path, exc)
             return {}
 
-    def _save(self, repo_path: str | Path, hashes: dict[str, str]) -> None:
+    def _save(self, repo_path: TrackerKey, hashes: dict[str, str]) -> None:
         """将文件哈希记录写入磁盘。
 
-        自动创建父目录。写入前加载已有记录并合并，
-        确保不会丢失未传入的文件记录。
+        自动创建父目录。
 
         Args:
-            repo_path: 仓库路径。
+            repo_path: 仓库标识。
             hashes: ``{rel_path: sha256}`` 映射。
         """
         path = self._get_tracker_path(repo_path)
@@ -223,17 +229,24 @@ class IndexTracker:
         logger.debug("已保存追踪记录: %s (%d 条)", path, len(hashes))
 
     @staticmethod
-    def _hash_repo_path(repo_path: str | Path) -> str:
-        """将仓库路径转换为唯一的目录名。
+    def _hash_repo_path(repo_path: TrackerKey) -> str:
+        """把仓库标识转换为唯一的目录名。
 
-        使用绝对路径的 SHA-256 哈希前 12 位，
-        与 :meth:`ChromaStore.get_collection_name` 保持一致。
-
-        Args:
-            repo_path: 仓库路径。
-
-        Returns:
-            12 位十六进制字符串。
+        - :class:`ResolvedRepo` → ``identity.collection_key``。
+        - ``Path`` / ``str`` → 绝对路径的 SHA-256 前 12 位（兼容老 manifest）。
         """
+        if isinstance(repo_path, ResolvedRepo):
+            return repo_path.identity.collection_key
         abs_path = str(Path(repo_path).resolve())
         return hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _resolve_abs_path(repo_path: TrackerKey) -> Path:
+        """把仓库标识解析为本地绝对路径。
+
+        - :class:`ResolvedRepo` → ``root_path``。
+        - ``Path`` / ``str`` → ``Path(repo_path).resolve()``。
+        """
+        if isinstance(repo_path, ResolvedRepo):
+            return repo_path.root_path
+        return Path(repo_path).resolve()

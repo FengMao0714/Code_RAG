@@ -43,6 +43,14 @@ class Settings(BaseSettings):
     index_tracker_dir: str = "~/.code-rag/indexes"
     max_chunk_tokens: int = 512
 
+    # ---------- 远程仓库 / 缓存配置 ----------
+    repo_cache_dir: str = "~/.code-rag/repos"
+    """远程 git 仓库的本地缓存根目录。"""
+    git_clone_depth: int = 1
+    """``git clone --depth`` 值；``0`` 表示完整克隆。"""
+    allow_private_git: bool = False
+    """是否允许私有仓库（默认 False，token 鉴权尚未实现）。"""
+
     @property
     def chroma_persist_path(self) -> Path:
         """ChromaDB 持久化目录的绝对路径。"""
@@ -52,6 +60,11 @@ class Settings(BaseSettings):
     def index_tracker_path(self) -> Path:
         """索引追踪数据目录的绝对路径。"""
         return Path(self.index_tracker_dir).expanduser().resolve()
+
+    @property
+    def repo_cache_path(self) -> Path:
+        """远程仓库本地缓存目录的绝对路径。"""
+        return Path(self.repo_cache_dir).expanduser().resolve()
 
 
 def get_settings() -> Settings:
