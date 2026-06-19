@@ -35,10 +35,13 @@ from code_rag.generator import LLMClient
 from code_rag.repository import (
     CacheManager,
     GitRepositoryError,
+    canonicalize_git_url,
+    identity_key_for_source,
     parse_repo_source,
+    redact_url,
     resolve_repo,
 )
-from code_rag.retriever import Retriever
+from code_rag.retriever.modes import SearchMode
 from code_rag.services import IndexService, ManifestService, QueryService
 from code_rag.store import vector_store as store_mod
 
@@ -92,17 +95,16 @@ def index(
 ) -> None:
     """索引代码仓库（首次全量，后续增量更新）。支持本地路径与 Git URL。"""
     setup_logging(verbose)
-    kind = parse_repo_source(source).kind
-    console.print(
-        f"[bold blue]>> 开始索引仓库 ({kind}): {source}"
-        + (f" @ {ref}" if ref else "")
-        + "[/bold blue]"
-    )
 
     try:
         settings = get_settings()
+        kind = parse_repo_source(source, allow_file=settings.allow_file_remote).kind
+        console.print(
+            f"[bold blue]>> 开始索引仓库 ({kind}): {source}"
+            + (f" @ {ref}" if ref else "")
+            + "[/bold blue]"
+        )
         service = IndexService(settings)
-        manifest_service = ManifestService(settings)
 
         with Progress(
             SpinnerColumn(spinner_name="line"),
@@ -120,22 +122,6 @@ def index(
         if not result.had_changes:
             console.print("[bold green][OK] 仓库无变更，无需更新索引[/bold green]")
             return
-
-        # 写入 manifest（包含真实 chunk 统计）
-        collection_name = result.collection_name
-        store = store_mod.ChromaStore(settings)
-        stats = store.get_stats(collection_name)
-        # 重新解析一次，以获取完整 ResolvedRepo（含 source_type / canonical_source）
-        from code_rag.repository import resolve_repo
-
-        resolved = resolve_repo(source, ref=ref, settings=settings)
-        manifest_service.update_manifest(
-            repo_path=resolved,
-            file_count=result.scanned_files,
-            chunk_count=int(stats.get("total_chunks", 0)),
-            chunk_types=stats.get("chunk_types", {}),
-            resolved=resolved,
-        )
 
         _print_index_result(result)
         console.print(
@@ -165,6 +151,12 @@ def ask(
     source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
     question: str = typer.Argument(..., help="你的问题"),
     ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    mode: str = typer.Option(
+        SearchMode.DEFAULT,
+        "--mode",
+        "-m",
+        help="检索模式: vector / lexical / hybrid",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
     """对已索引的代码仓库提问。支持本地路径与 Git URL。"""
@@ -182,7 +174,7 @@ def ask(
             console=console,
         ) as progress:
             task = progress.add_task("检索相关代码...", total=None)
-            result = service.ask(question, source, ref=ref)
+            result = service.ask(question, source, ref=ref, mode=mode)
             progress.update(task, description=f"检索到 {len(result.retrieval.chunks)} 个相关片段")
 
         if not result.retrieval.context:
@@ -219,6 +211,12 @@ def ask(
 def chat(
     source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
     ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    mode: str = typer.Option(
+        SearchMode.DEFAULT,
+        "--mode",
+        "-m",
+        help="检索模式: vector / lexical / hybrid",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
     """进入交互式对话模式。支持本地路径与 Git URL。"""
@@ -242,7 +240,7 @@ def chat(
             if not question.strip():
                 continue
 
-            result = service.ask(question, source, ref=ref)
+            result = service.ask(question, source, ref=ref, mode=mode)
 
             if not result.retrieval.context:
                 console.print("[yellow]未找到相关代码[/yellow]\n")
@@ -287,7 +285,9 @@ def list_repos() -> None:
         ref = entry.ref or "-"
         src = entry.canonical_source or entry.repo_path
         if entry.source_type == "git":
-            display = src if len(src) <= 60 else "..." + src[-57:]
+            display = redact_url(src)
+            if len(display) > 60:
+                display = "..." + display[-57:]
         else:
             display = entry.repo_path
         table.add_row(
@@ -319,7 +319,10 @@ def status(
 
     if manifest:
         console.print(f"  类型: {manifest.source_type}")
-        console.print(f"  来源: {manifest.canonical_source or manifest.repo_path}")
+        src_display = manifest.canonical_source or manifest.repo_path
+        if manifest.source_type == "git":
+            src_display = redact_url(src_display)
+        console.print(f"  来源: {src_display}")
         if manifest.display_name:
             console.print(f"  名称: {manifest.display_name}")
         if manifest.ref:
@@ -367,11 +370,9 @@ def remove(
     store = store_mod.ChromaStore(settings)
     manifest_service = ManifestService(settings)
 
-    # 解析为 ResolvedRepo，再得到 collection name
-    resolved = resolve_repo(source, ref=ref, settings=settings)
-    collection_name = store_mod.ChromaStore.get_collection_name_from_key(
-        resolved.identity.collection_key
-    )
+    # 仅计算 key，不触发 clone
+    collection_key = identity_key_for_source(source, ref, settings=settings)
+    collection_name = store_mod.ChromaStore.get_collection_name_from_key(collection_key)
 
     # 删除 ChromaDB collection
     store.delete_collection(collection_name)
@@ -379,18 +380,23 @@ def remove(
     # 删除 tracker 目录
     import shutil
 
-    tracker_dir = settings.index_tracker_path / resolved.identity.collection_key
+    tracker_dir = settings.index_tracker_path / collection_key
     if tracker_dir.exists():
         shutil.rmtree(tracker_dir, ignore_errors=True)
 
-    # 兼容老实现：单文件 manifest 路径的清理
-    manifest_service.remove_manifest(resolved)
+    # 删除 manifest
+    manifest_service.remove_manifest_by_key(collection_key)
 
-    # 可选：同时删除缓存
-    if with_cache and resolved.cache_path is not None:
-        cache = CacheManager(settings.repo_cache_dir)
-        cache.remove(resolved.identity.canonical_source)
-        console.print(f"[dim]已同时删除远程仓库缓存: {resolved.cache_path}[/dim]")
+    # 可选：同时删除缓存（仅当缓存已存在时）
+    if with_cache:
+        repo_source = parse_repo_source(source, allow_file=settings.allow_file_remote)
+        if repo_source.kind == "git":
+            canonical = canonicalize_git_url(source)
+            cache = CacheManager(settings.repo_cache_dir)
+            cache_entry = cache.get(canonical)
+            if cache_entry is not None:
+                cache.remove(canonical)
+                console.print(f"[dim]已同时删除远程仓库缓存: {cache_entry.cache_dir}[/dim]")
 
     console.print(f"[bold green][OK] 已删除 {source} 的索引数据[/bold green]")
 
@@ -401,7 +407,7 @@ def search(
     query: str = typer.Argument(..., help="检索查询"),
     top_k: int = typer.Option(8, "--top-k", "-k", help="最大返回结果数"),
     mode: str = typer.Option(
-        "vector",
+        SearchMode.DEFAULT,
         "--mode",
         "-m",
         help="检索模式: vector / lexical / hybrid",
@@ -416,57 +422,33 @@ def search(
 
     try:
         settings = get_settings()
-        resolved = resolve_repo(source, ref=ref, settings=settings)
+        mode = SearchMode.normalize(mode)
         store = store_mod.ChromaStore(settings)
-        coll_name = store_mod.ChromaStore.get_collection_name_from_key(
-            resolved.identity.collection_key
-        )
+        collection_key = identity_key_for_source(source, ref, settings=settings)
+        coll_name = store_mod.ChromaStore.get_collection_name_from_key(collection_key)
         stats = store.get_stats(coll_name)
 
         if not stats["exists"]:
             console.print("[yellow]该仓库尚未索引，请先运行 index 命令[/yellow]")
-            raise typer.Exit(0)
+            return
 
-        # 选择检索模式
-        if mode == "vector":
-            retriever = Retriever(settings)
-            results = retriever.retrieve(query, resolved, top_k=top_k)
-            stage_label = "vector"
-        elif mode == "lexical":
-            from code_rag.retriever.lexical import LexicalRetriever
+        resolved = resolve_repo(source, ref=ref, settings=settings)
+        from code_rag.services.query_service import build_retriever
 
-            lex = LexicalRetriever(store, resolved)
-            results = lex.search(query, top_k=top_k)
-            stage_label = "lexical"
-        elif mode == "hybrid":
-            from code_rag.retriever.hybrid import HybridRetriever
-            from code_rag.retriever.lexical import LexicalRetriever
-            from code_rag.retriever.rerank import RRFReranker
-
-            base = Retriever(settings)
-            lex = LexicalRetriever(store, resolved)
-            hybrid = HybridRetriever(
-                vector_retriever=base,
-                lexical_retriever=lex,
-                reranker=RRFReranker(),
-            )
-            results = hybrid.search(query, resolved, top_k=top_k)
-            stage_label = "hybrid"
-        else:
-            console.print(f"[red]不支持的检索模式: {mode}（应为 vector/lexical/hybrid）[/red]")
-            raise typer.Exit(1)
+        retriever_fn = build_retriever(mode, settings, resolved)
+        results = retriever_fn(query, top_k, None)
 
         if not results:
             console.print("[yellow]未检索到任何结果[/yellow]")
-            raise typer.Exit(0)
+            return
 
         # 输出结果
-        console.print(f"\n[bold]检索到 {len(results)} 条结果[/bold] (mode={stage_label})\n")
+        console.print(f"\n[bold]检索到 {len(results)} 条结果[/bold] (mode={mode})\n")
         for i, result in enumerate(results, 1):
             chunk = result.chunk
             extras = []
             if explain:
-                stage = getattr(result, "stage", stage_label)
+                stage = getattr(result, "stage", mode)
                 extras.append(f"stage={stage}")
             extra_str = "  ".join(extras)
             line = (
@@ -482,6 +464,10 @@ def search(
             if chunk.parent:
                 console.print(f"      parent={chunk.parent}")
         console.print()
+
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from None
 
     except FileNotFoundError as exc:
         console.print(f"[red]错误：{exc}[/red]")
@@ -507,7 +493,7 @@ def eval(
     ),
     top_k: int = typer.Option(8, "--top-k", "-k", help="检索 top_k"),
     mode: str = typer.Option(
-        "vector",
+        SearchMode.DEFAULT,
         "--mode",
         "-m",
         help="检索模式: vector / lexical / hybrid",
@@ -515,6 +501,11 @@ def eval(
     ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
     output: Path | None = typer.Option(None, "--output", "-o", help="JSON 报告输出路径"),
     markdown: Path | None = typer.Option(None, "--markdown", help="Markdown 报告输出路径"),
+    compare_modes: str | None = typer.Option(
+        None,
+        "--compare-modes",
+        help="逗号分隔的检索模式对比，如 vector,lexical,hybrid",
+    ),
 ) -> None:
     """对 golden query 数据集运行检索评测（不调用 LLM）。"""
     try:
@@ -542,6 +533,57 @@ def eval(
         return
 
     console.print(f"  loaded: {len(ds.queries)} 条 golden query")
+
+    if compare_modes:
+        try:
+            modes = SearchMode.parse_csv(compare_modes)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(1) from None
+
+        console.print("\n[bold]模式对比[/bold]")
+        comparison = service.compare_modes(
+            ds,
+            repo_path=source,
+            top_k=top_k,
+            modes=modes,
+            ref=ref,
+        )
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Mode", style="cyan")
+        table.add_column("Recall@1", justify="right")
+        table.add_column("Recall@3", justify="right")
+        table.add_column("Recall@8", justify="right")
+        table.add_column("MRR", justify="right")
+        table.add_column("File Hit", justify="right")
+        table.add_column("Symbol Hit", justify="right")
+        table.add_column("Latency", justify="right")
+        for mode_name, summary in comparison.items():
+            table.add_row(
+                mode_name,
+                f"{summary.recall_at_1:.2%}",
+                f"{summary.recall_at_3:.2%}",
+                f"{summary.recall_at_8:.2%}",
+                f"{summary.mrr:.4f}",
+                f"{summary.file_hit_rate:.2%}",
+                f"{summary.symbol_hit_rate:.2%}",
+                f"{summary.avg_latency_ms:.1f}ms",
+            )
+        console.print(table)
+        if output or markdown:
+            paths = service.write_comparison_reports(
+                comparison,
+                dataset_name=ds.name,
+                repo_path=str(source),
+                top_k=top_k,
+                output_json=str(output) if output else None,
+                output_markdown=str(markdown) if markdown else None,
+            )
+            if paths.json_path:
+                console.print(f"  JSON 报告: {paths.json_path}")
+            if paths.markdown_path:
+                console.print(f"  Markdown 报告: {paths.markdown_path}")
+        return
 
     with Progress(
         SpinnerColumn(spinner_name="line"),
@@ -618,6 +660,12 @@ def agent(
         help="只生成修改计划（默认开启，不调用 LLM 也不修改文件）",
     ),
     top_k: int = typer.Option(5, "--top-k", "-k", help="每个子问题的检索条数"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="写出 Agent 报告路径"),
+    report_format: str = typer.Option(
+        "markdown",
+        "--format",
+        help="Agent 报告格式: markdown / json",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
     """轻量 Code Agent：拆解任务 → 检索 → 汇总计划（只读）。"""
@@ -632,11 +680,19 @@ def agent(
 
         agent_obj = CodeAgent(settings=settings)
         report = agent_obj.run(AgentTask(task=task, resolved=resolved, plan_only=plan_only))
+        if output is not None:
+            from code_rag.agent import write_agent_report
+
+            written = write_agent_report(report, output, fmt=report_format)
+            console.print(f"[dim]Agent 报告已写入: {written}[/dim]")
     except FileNotFoundError as exc:
         console.print(f"[red]错误：{exc}[/red]")
         raise typer.Exit(1) from None
     except GitRepositoryError as exc:
         console.print(f"[red]Git 错误：{exc}[/red]")
+        raise typer.Exit(1) from None
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from None
     except Exception as exc:
         console.print(f"[red]错误: {exc}[/red]")
@@ -719,7 +775,7 @@ def cache_list() -> None:
     table.add_column("更新时间", style="dim")
 
     for entry in entries:
-        url = entry.canonical_url
+        url = redact_url(entry.canonical_url)
         if len(url) > 60:
             url = "..." + url[-57:]
         table.add_row(
@@ -763,7 +819,7 @@ def _print_index_result(result) -> None:  # type: ignore[no-untyped-def]
     """打印索引结果摘要，对 git 仓库展示额外信息。"""
     if result.source_type == "git":
         console.print("  [cyan]类型[/cyan]: git")
-        console.print(f"  [cyan]URL[/cyan]: {result.canonical_source}")
+        console.print(f"  [cyan]URL[/cyan]: {redact_url(result.canonical_source)}")
         if result.ref:
             console.print(f"  [cyan]Ref[/cyan]: {result.ref}")
         if result.commit:

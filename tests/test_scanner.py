@@ -7,6 +7,8 @@
 - 文件哈希
 - .gitignore 过滤
 - 跨平台路径（Windows 反斜杠兼容）
+- 符号链接跳过
+- 敏感文件过滤
 """
 
 from __future__ import annotations
@@ -295,6 +297,31 @@ class TestGitignoreFilter:
         assert "main.py" in names
         assert "guide.md" not in names
 
+    def test_subdir_gitignore_does_not_affect_other_dirs(self, tmp_path: Path) -> None:
+        """子目录 .gitignore 的规则不应影响其他目录中的文件。"""
+        _create_file(tmp_path / "a" / ".gitignore", "*.py\n")
+        _create_file(tmp_path / "a" / "ignore.py", "x = 1")
+        _create_file(tmp_path / "b" / "keep.py", "y = 2")
+
+        entries = RepoScanner(tmp_path).scan()
+        rel_paths = _rel_paths(entries)
+        assert "b/keep.py" in rel_paths
+        assert "a/ignore.py" not in rel_paths
+
+    def test_subdir_anchored_gitignore_matches_from_subdir_root(self, tmp_path: Path) -> None:
+        """子目录 .gitignore 的 /anchored 规则应以该子目录为根。"""
+        _create_file(tmp_path / "a" / ".gitignore", "/ignore.py\n")
+        _create_file(tmp_path / "a" / "ignore.py", "x = 1")
+        _create_file(tmp_path / "a" / "nested" / "ignore.py", "x = 2")
+        _create_file(tmp_path / "b" / "ignore.py", "y = 1")
+
+        entries = RepoScanner(tmp_path).scan()
+        rel_paths = _rel_paths(entries)
+
+        assert "a/ignore.py" not in rel_paths
+        assert "a/nested/ignore.py" in rel_paths
+        assert "b/ignore.py" in rel_paths
+
 
 # ---------------------------------------------------------------------------
 # 跨平台路径
@@ -370,3 +397,102 @@ class TestEdgeCases:
         assert e.language == "python"
         assert e.is_code is True
         assert e.is_doc is False
+
+
+# ---------------------------------------------------------------------------
+# 符号链接过滤
+# ---------------------------------------------------------------------------
+
+
+class TestSymlinkFilter:
+    """测试符号链接文件和目录的过滤。"""
+
+    def test_symlink_file_skipped(self, tmp_path: Path) -> None:
+        """符号链接文件应被跳过。"""
+        real = tmp_path / "real.py"
+        _create_file(real, "x = 1")
+        link = tmp_path / "link.py"
+        try:
+            link.symlink_to(real)
+        except OSError:
+            # Windows 无权限创建 symlink 时跳过
+            return
+        entries = RepoScanner(tmp_path).scan()
+        assert _names(entries) == ["real.py"]
+
+    def test_symlink_dir_skipped(self, tmp_path: Path) -> None:
+        """符号链接目录应被跳过。"""
+        real_dir = tmp_path / "real_dir"
+        _create_file(real_dir / "mod.py", "x = 1")
+        link_dir = tmp_path / "link_dir"
+        try:
+            link_dir.symlink_to(real_dir)
+        except OSError:
+            return
+        entries = RepoScanner(tmp_path).scan()
+        assert _rel_paths(entries) == ["real_dir/mod.py"]
+
+
+# ---------------------------------------------------------------------------
+# 敏感文件过滤
+# ---------------------------------------------------------------------------
+
+
+class TestSensitiveFileFilter:
+    """测试敏感文件名和敏感内容的过滤。"""
+
+    def test_sensitive_filenames_ignored(self, tmp_path: Path) -> None:
+        """敏感文件名应被默认忽略。"""
+        sensitive_names = [
+            ".npmrc",
+            ".pypirc",
+            "id_rsa",
+            "id_dsa",
+            "credentials.json",
+            "secrets.json",
+            "credentials.yaml",
+            "secrets.yaml",
+        ]
+        for name in sensitive_names:
+            _create_file(tmp_path / name, "sensitive data")
+        _create_file(tmp_path / "app.py", "x = 1")
+
+        entries = RepoScanner(tmp_path).scan()
+        assert _names(entries) == ["app.py"]
+
+    def test_normal_config_yaml_not_ignored(self, tmp_path: Path) -> None:
+        """普通的 config.example.yaml 不应被忽略。"""
+        _create_file(tmp_path / "config.example.yaml", "key: value")
+        _create_file(tmp_path / "app.py", "x = 1")
+
+        entries = RepoScanner(tmp_path).scan()
+        names = _names(entries)
+        assert "config.example.yaml" in names
+        assert "app.py" in names
+
+    def test_doc_with_sensitive_content_skipped(self, tmp_path: Path) -> None:
+        """包含 API_KEY= 等敏感模式的文档文件应被跳过。"""
+        _create_file(tmp_path / "setup.md", "# Setup\nAPI_KEY=abc123\n")
+        _create_file(tmp_path / "README.md", "# Normal doc\n")
+
+        entries = RepoScanner(tmp_path).scan()
+        names = _names(entries)
+        assert "README.md" in names
+        assert "setup.md" not in names
+
+    def test_doc_with_secret_pattern_skipped(self, tmp_path: Path) -> None:
+        """包含 SECRET= 的文档文件应被跳过。"""
+        _create_file(tmp_path / "deploy.txt", "SECRET=mysecret\n")
+        _create_file(tmp_path / "guide.txt", "How to deploy\n")
+
+        entries = RepoScanner(tmp_path).scan()
+        names = _names(entries)
+        assert "guide.txt" in names
+        assert "deploy.txt" not in names
+
+    def test_code_file_with_sensitive_content_not_skipped(self, tmp_path: Path) -> None:
+        """代码文件中即使包含敏感模式也不应被跳过（仅检测文档类）。"""
+        _create_file(tmp_path / "config.py", 'API_KEY = "abc"')
+
+        entries = RepoScanner(tmp_path).scan()
+        assert _names(entries) == ["config.py"]

@@ -131,6 +131,18 @@ class TestChromaStoreCRUD:
         results = store.query(coll_name, _fake_embedding(), top_k=5)
         assert results == []
 
+    def test_query_nonexistent_collection_no_side_effect(self, tmp_path: Path) -> None:
+        """未索引 collection 调用 query 后不会创建空 collection。"""
+        store = ChromaStore(_make_settings(tmp_path))
+        coll_name = "test-nonexistent"
+
+        results = store.query(coll_name, _fake_embedding(), top_k=5)
+        assert results == []
+
+        # collection 不应被创建
+        stats = store.get_stats(coll_name)
+        assert stats["exists"] is False
+
     def test_query_with_distance_threshold(self, tmp_path: Path) -> None:
         """距离阈值过滤。"""
         store = ChromaStore(_make_settings(tmp_path))

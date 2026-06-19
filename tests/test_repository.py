@@ -19,6 +19,7 @@ import pytest
 
 from code_rag.repository import (
     CacheManager,
+    GitRepositoryError,
     GitRepositoryProvider,
     InvalidRepoSourceError,
     LocalRepositoryProvider,
@@ -29,6 +30,7 @@ from code_rag.repository import (
     collection_key_for_git,
     collection_key_for_local,
     parse_repo_source,
+    redact_url,
     resolve_repo,
 )
 from code_rag.repository.models import (
@@ -66,8 +68,38 @@ class TestParseRepoSource:
         src = parse_repo_source("https://github.com/owner/repo.git")
         assert src.kind == SOURCE_TYPE_GIT
 
-    def test_http_url(self) -> None:
-        src = parse_repo_source("http://gitlab.example.com/owner/repo.git")
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://gitlab.example.com/owner/repo.git",
+            "ftp://example.com/repo.git",
+            "git://github.com/owner/repo.git",
+            "file:///tmp/repo.git",
+        ],
+    )
+    def test_unsafe_url_schemes_rejected_by_default(self, url: str) -> None:
+        """不安全或本地文件 URL 默认应清晰拒绝，不能落入 local 分支。"""
+        with pytest.raises(InvalidRepoSourceError, match="不支持的 URL 协议"):
+            parse_repo_source(url)
+
+    def test_ftp_url_rejected(self) -> None:
+        """ftp:// 始终被拒绝。"""
+        with pytest.raises(InvalidRepoSourceError):
+            parse_repo_source("ftp://example.com/repo.git")
+
+    def test_git_protocol_rejected(self) -> None:
+        """git:// 默认被拒绝。"""
+        with pytest.raises(InvalidRepoSourceError):
+            parse_repo_source("git://github.com/owner/repo.git")
+
+    def test_file_url_rejected_by_default(self) -> None:
+        """file:// 默认被拒绝。"""
+        with pytest.raises(InvalidRepoSourceError):
+            parse_repo_source("file:///tmp/repo.git")
+
+    def test_file_url_allowed_when_explicit(self) -> None:
+        """allow_file=True 时接受 file://。"""
+        src = parse_repo_source("file:///tmp/repo.git", allow_file=True)
         assert src.kind == SOURCE_TYPE_GIT
 
     def test_scp_like_ssh(self) -> None:
@@ -79,8 +111,9 @@ class TestParseRepoSource:
         assert src.kind == SOURCE_TYPE_GIT
 
     def test_git_protocol(self) -> None:
-        src = parse_repo_source("git://github.com/owner/repo.git")
-        assert src.kind == SOURCE_TYPE_GIT
+        """git:// 默认被拒绝（不安全 scheme）。"""
+        with pytest.raises(InvalidRepoSourceError):
+            parse_repo_source("git://github.com/owner/repo.git")
 
     def test_empty_raises(self) -> None:
         with pytest.raises(InvalidRepoSourceError):
@@ -116,6 +149,48 @@ class TestCanonicalizeGitUrl:
     def test_host_lowercased(self) -> None:
         out = canonicalize_git_url("https://GitHub.COM/owner/repo.git")
         assert out == "https://github.com/owner/repo.git"
+
+    def test_https_with_token_rejected(self) -> None:
+        """HTTPS URL 包含 token 时应抛出错误。"""
+        with pytest.raises(GitRepositoryError, match="凭据"):
+            canonicalize_git_url("https://token123@github.com/owner/repo.git")
+
+    def test_https_with_userinfo_rejected(self) -> None:
+        """HTTPS URL 包含 user:password 时应抛出错误。"""
+        with pytest.raises(GitRepositoryError, match="凭据"):
+            canonicalize_git_url("https://user:pass@github.com/owner/repo.git")
+
+    def test_ssh_with_userinfo_allowed(self) -> None:
+        """SSH URL 包含 git@ 用户名是正常的，应允许。"""
+        out = canonicalize_git_url("ssh://git@github.com/owner/repo.git")
+        assert out == "ssh://git@github.com/owner/repo.git"
+
+
+# ---------------------------------------------------------------------------
+# redact_url
+# ---------------------------------------------------------------------------
+
+
+class TestRedactUrl:
+    def test_https_no_userinfo_unchanged(self) -> None:
+        assert (
+            redact_url("https://github.com/owner/repo.git") == "https://github.com/owner/repo.git"
+        )
+
+    def test_https_with_token_redacted(self) -> None:
+        out = redact_url("https://token123@github.com/owner/repo.git")
+        assert out == "https://***@github.com/owner/repo.git"
+        assert "token123" not in out
+
+    def test_ssh_git_at_preserved(self) -> None:
+        """SSH URL 中的 git@ 是 SSH 用户名，不做替换。"""
+        out = redact_url("ssh://git@github.com/owner/repo.git")
+        assert out == "ssh://git@github.com/owner/repo.git"
+
+    def test_scp_like_preserved(self) -> None:
+        """scp-like 形式不做替换。"""
+        out = redact_url("git@github.com:owner/repo.git")
+        assert out == "git@github.com:owner/repo.git"
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +368,7 @@ class TestGitProviderLocal:
         bare = self._create_bare_remote(tmp_path)
         cache_root = tmp_path / "cache"
         cache = CacheManager(cache_root)
-        provider = GitRepositoryProvider(cache, clone_depth=1)
+        provider = GitRepositoryProvider(cache, clone_depth=1, allow_file=True)
 
         url = bare.as_uri()  # file://... 形式
         src = RepoSource(raw=url, kind="git")
@@ -313,7 +388,7 @@ class TestGitProviderLocal:
         bare = self._create_bare_remote(tmp_path)
         cache_root = tmp_path / "cache"
         cache = CacheManager(cache_root)
-        provider = GitRepositoryProvider(cache, clone_depth=1)
+        provider = GitRepositoryProvider(cache, clone_depth=1, allow_file=True)
 
         url = bare.as_uri()
         src = RepoSource(raw=url, kind="git", ref="feature")
@@ -323,7 +398,7 @@ class TestGitProviderLocal:
     def test_invalid_ref_raises(self, tmp_path: Path) -> None:
         bare = self._create_bare_remote(tmp_path)
         cache = CacheManager(tmp_path / "cache")
-        provider = GitRepositoryProvider(cache, clone_depth=1)
+        provider = GitRepositoryProvider(cache, clone_depth=1, allow_file=True)
         src = RepoSource(raw=bare.as_uri(), kind="git", ref="nonexistent-branch")
         with pytest.raises(Exception):
             provider.resolve(src)
@@ -331,7 +406,7 @@ class TestGitProviderLocal:
     def test_refresh_creates_new_metadata(self, tmp_path: Path) -> None:
         bare = self._create_bare_remote(tmp_path)
         cache = CacheManager(tmp_path / "cache")
-        provider = GitRepositoryProvider(cache, clone_depth=1)
+        provider = GitRepositoryProvider(cache, clone_depth=1, allow_file=True)
         src = RepoSource(raw=bare.as_uri(), kind="git")
 
         resolved1 = provider.resolve(src)
@@ -342,6 +417,74 @@ class TestGitProviderLocal:
         assert resolved2.identity.commit == first_commit
         # 缓存目录仍然存在
         assert (tmp_path / "cache").is_dir()
+
+    def _push_new_commit(self, bare: Path, tmp_path: Path) -> str:
+        """向 bare repo 推送一个新 commit，返回新 commit SHA。"""
+        work2 = tmp_path / "push_work"
+        work2.mkdir()
+        subprocess.run(["git", "clone", "-q", str(bare), str(work2)], check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"], cwd=str(work2), check=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=str(work2), check=True)
+        (work2 / "new_file.txt").write_text("new content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=str(work2), check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "second"], cwd=str(work2), check=True)
+        subprocess.run(["git", "push", "-q"], cwd=str(work2), check=True)
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(work2), capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+
+    def test_no_refresh_keeps_old_commit(self, tmp_path: Path) -> None:
+        """refresh=False 时复用本地缓存，不拉取远端新 commit。"""
+        bare = self._create_bare_remote(tmp_path)
+        cache = CacheManager(tmp_path / "cache")
+        provider = GitRepositoryProvider(cache, clone_depth=0, allow_file=True)
+        src = RepoSource(raw=bare.as_uri(), kind="git")
+
+        resolved1 = provider.resolve(src)
+        old_commit = resolved1.identity.commit
+
+        # 向远端推送新 commit
+        new_commit = self._push_new_commit(bare, tmp_path)
+        assert new_commit != old_commit
+
+        # refresh=False：应保持旧 commit
+        resolved2 = provider.resolve(src, refresh=False)
+        assert resolved2.identity.commit == old_commit
+
+    def test_refresh_updates_to_new_commit(self, tmp_path: Path) -> None:
+        """refresh=True 时 fetch 并更新到远端新 commit。"""
+        bare = self._create_bare_remote(tmp_path)
+        cache = CacheManager(tmp_path / "cache")
+        provider = GitRepositoryProvider(cache, clone_depth=0, allow_file=True)
+        src = RepoSource(raw=bare.as_uri(), kind="git")
+
+        resolved1 = provider.resolve(src)
+        old_commit = resolved1.identity.commit
+
+        new_commit = self._push_new_commit(bare, tmp_path)
+        assert new_commit != old_commit
+
+        # refresh=True：应更新到新 commit
+        resolved2 = provider.resolve(src, refresh=True)
+        assert resolved2.identity.commit == new_commit
+
+    def test_refresh_removes_untracked_files(self, tmp_path: Path) -> None:
+        """缓存 worktree 中手动放入的未跟踪文件在 refresh 后应消失。"""
+        bare = self._create_bare_remote(tmp_path)
+        cache = CacheManager(tmp_path / "cache")
+        provider = GitRepositoryProvider(cache, clone_depth=1, allow_file=True)
+        src = RepoSource(raw=bare.as_uri(), kind="git")
+
+        resolved = provider.resolve(src)
+        untracked = resolved.root_path / "untracked_junk.txt"
+        untracked.write_text("should be cleaned\n", encoding="utf-8")
+        assert untracked.exists()
+
+        provider.resolve(src, refresh=True)
+        assert not untracked.exists()
 
 
 # ---------------------------------------------------------------------------

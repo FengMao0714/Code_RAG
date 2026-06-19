@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from code_rag.config import Settings, get_settings
-from code_rag.repository import ResolvedRepo, resolve_repo
+from code_rag.repository import ResolvedRepo, identity_key_for_source, resolve_repo
 from code_rag.store.vector_store import ChromaStore
 
 logger = logging.getLogger(__name__)
@@ -241,6 +241,10 @@ class ManifestService:
     ) -> tuple[ManifestEntry | None, dict]:
         """读取 manifest 与当前 ChromaDB 统计。
 
+        优先使用 :func:`identity_key_for_source` 仅计算 key，避免对
+        远程 Git URL 触发 clone / fetch。仅当 key 查不到 manifest 且
+        需要写入时才回退到完整解析。
+
         Args:
             repo_path: 仓库标识。
             ref: 可选 git ref，仅当 ``repo_path`` 不是 :class:`ResolvedRepo` 时生效。
@@ -249,10 +253,18 @@ class ManifestService:
         Returns:
             ``(manifest, store_stats)`` 元组。
         """
-        if ref is not None and not isinstance(repo_path, ResolvedRepo):
-            resolved_obj = resolve_repo(str(repo_path), ref=ref, settings=self._settings)
+        if isinstance(repo_path, ResolvedRepo):
+            resolved_obj = repo_path
+        elif resolved is not None:
+            resolved_obj = resolved
         else:
-            resolved_obj = self._ensure_resolved(repo_path, resolved)
+            # 只计算 key，不 clone
+            collection_key = identity_key_for_source(str(repo_path), ref, settings=self._settings)
+            collection_name = ChromaStore.get_collection_name_from_key(collection_key)
+            manifest = self._get_manifest_by_key(collection_key)
+            store_stats = self._store.get_stats(collection_name)
+            return manifest, store_stats
+
         manifest = self.get_manifest(resolved_obj)
         collection_name = ChromaStore.get_collection_name_from_key(
             resolved_obj.identity.collection_key
@@ -263,6 +275,38 @@ class ManifestService:
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
+
+    def _get_manifest_by_key(self, collection_key: str) -> ManifestEntry | None:
+        """根据 collection_key 直接读取 manifest，不触发 resolve。"""
+        manifest_path = self._manifest_path_for(collection_key)
+        if not manifest_path.is_file():
+            return None
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return ManifestEntry.from_dict(data)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("无法读取 manifest %s: %s", manifest_path, exc)
+            return None
+
+    def remove_manifest_by_key(self, collection_key: str) -> bool:
+        """根据 collection_key 删除 manifest，不触发 resolve。
+
+        Args:
+            collection_key: 稳定的 collection key。
+
+        Returns:
+            是否删除了 manifest。
+        """
+        manifest_path = self._manifest_path_for(collection_key)
+        if not manifest_path.is_file():
+            return False
+        try:
+            manifest_path.unlink()
+            logger.info("已删除 manifest: %s", manifest_path)
+            return True
+        except OSError as exc:
+            logger.warning("无法删除 manifest %s: %s", manifest_path, exc)
+            return False
 
     def _manifest_path_for(self, collection_key: str) -> Path:
         """根据 collection_key 返回 manifest.json 路径。"""

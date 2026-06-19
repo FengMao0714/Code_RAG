@@ -26,6 +26,31 @@ class GitRepositoryError(RuntimeError):
     """Git 操作失败。"""
 
 
+def redact_url(url: str) -> str:
+    """将 URL 中的 userinfo（token / password）替换为 ``***``。
+
+    ``ssh://git@host/path`` 中的 ``git@`` 不做替换（SSH 用户名非凭据）。
+    ``https://token@host/path`` 中的 ``token@`` 替换为 ``***@``。
+    """
+    text = url.strip()
+    # scp-like 形式 ``git@host:path`` 不含凭据风险，原样返回
+    if "://" not in text and _SSH_RE.match(text):
+        return text
+    parsed = urlparse(text)
+    if not parsed.netloc or "@" not in parsed.netloc:
+        return text
+    # SSH URL 的 userinfo 是 SSH 用户名（如 git），不替换
+    if parsed.scheme.lower() in ("ssh", "git+ssh"):
+        return text
+    # 其他 scheme（https 等）：替换 userinfo
+    _, _, host = parsed.netloc.rpartition("@")
+    redacted_netloc = f"***@{host}"
+    return urlunparse((parsed.scheme, redacted_netloc, parsed.path, "", "", ""))
+
+
+_SSH_RE = re.compile(r"^([a-zA-Z0-9_.\-]+)@([a-zA-Z0-9_.\-]+):(.*)$")
+
+
 def canonicalize_git_url(url: str) -> str:
     """规范化 git URL。
 
@@ -65,6 +90,12 @@ def canonicalize_git_url(url: str) -> str:
     user = ""
     if "@" in netloc:
         user, _, host_part = netloc.rpartition("@")
+        # 对 HTTPS URL 拒绝 userinfo（token / password）
+        if scheme in ("https", "http"):
+            raise GitRepositoryError(
+                f"HTTPS URL 中不应包含凭据信息（userinfo），"
+                f"请使用不带 token 的 URL: {redact_url(url)}"
+            )
         user = user + "@"
         host = host_part.lower()
     else:
@@ -82,6 +113,10 @@ def canonicalize_git_url(url: str) -> str:
     return canonical
 
 
+_SAFE_SCHEMES = {"https", "ssh", "git+ssh"}
+_FILE_SCHEME = {"file"}
+
+
 class GitRepositoryProvider:
     """Git 仓库 provider。
 
@@ -89,6 +124,7 @@ class GitRepositoryProvider:
         cache: :class:`CacheManager` 实例。
         clone_depth: 默认 ``--depth`` 值；``0`` 表示完整克隆。
         allow_private: 是否允许私有仓库（暂未真正支持鉴权，仅作为配置项）。
+        allow_file: 是否允许 ``file://`` 协议（默认拒绝，仅测试使用）。
     """
 
     def __init__(
@@ -97,11 +133,13 @@ class GitRepositoryProvider:
         *,
         clone_depth: int = 1,
         allow_private: bool = False,
+        allow_file: bool = False,
     ) -> None:
         """初始化 provider。"""
         self._cache = cache
         self._clone_depth = int(clone_depth) if clone_depth else 0
         self._allow_private = bool(allow_private)
+        self._allow_file = bool(allow_file)
 
     @property
     def cache(self) -> CacheManager:
@@ -120,7 +158,7 @@ class GitRepositoryProvider:
 
         1. 规范化 URL。
         2. 计算缓存目录。
-        3. 缓存不存在或 ``refresh=True`` 时执行 clone；否则 fetch。
+        3. 缓存不存在时执行 clone；缓存存在时 checkout 到目标 ref（``refresh=True`` 时先 fetch）。
         4. 切换到指定 ref（branch / tag / commit），并记录 commit SHA。
 
         Args:
@@ -134,6 +172,15 @@ class GitRepositoryProvider:
             GitRepositoryError: 任何 git 操作失败。
         """
         canonical = canonicalize_git_url(source.raw)
+        # 校验 scheme 安全性
+        parsed = urlparse(canonical)
+        scheme = parsed.scheme.lower()
+        if scheme not in _SAFE_SCHEMES:
+            if not (self._allow_file and scheme in _FILE_SCHEME):
+                raise GitRepositoryError(
+                    f"不安全的 URL scheme: {scheme}://，"
+                    f"仅允许 https:// 和 ssh://（file:// 需显式开启 allow_file）"
+                )
         cache_dir = self._cache.cache_dir_for(canonical)
         worktree = cache_dir / "worktree"
 
@@ -143,7 +190,7 @@ class GitRepositoryProvider:
         else:
             # 缓存已存在：refresh=True 时先尝试 fetch + checkout（不重新 clone），
             # 这样在 Windows 上可以避免 git pack 文件句柄未释放的问题。
-            self._fetch_and_checkout(canonical, worktree, ref=source.ref)
+            self._fetch_and_checkout(canonical, worktree, ref=source.ref, refresh=refresh)
 
         commit = self._resolve_commit(worktree)
         identity = RepoIdentity(
@@ -163,7 +210,7 @@ class GitRepositoryProvider:
         )
         logger.info(
             "Git 仓库解析: %s -> %s (commit=%s)",
-            source.raw,
+            redact_url(source.raw),
             worktree,
             commit,
         )
@@ -192,7 +239,7 @@ class GitRepositoryProvider:
             shutil.rmtree(worktree.parent, ignore_errors=True)
 
         worktree.parent.mkdir(parents=True, exist_ok=True)
-        logger.info("正在 clone: %s -> %s", url, worktree)
+        logger.info("正在 clone: %s -> %s", redact_url(url), worktree)
         try:
             clone_kwargs: dict = {}
             if self._clone_depth and self._clone_depth > 0:
@@ -209,8 +256,17 @@ class GitRepositoryProvider:
             # ref 是 commit 或 tag 时需要 checkout
             self._checkout(worktree, ref)
 
-    def _fetch_and_checkout(self, url: str, worktree: Path, *, ref: str | None) -> None:
-        """对已有缓存执行 fetch + checkout。"""
+    def _fetch_and_checkout(
+        self, url: str, worktree: Path, *, ref: str | None, refresh: bool = False
+    ) -> None:
+        """对已有缓存执行 checkout（可选 fetch），并 reset --hard + clean 确保干净状态。
+
+        Args:
+            url: 远程仓库 URL（当前未使用，保留接口一致性）。
+            worktree: 本地 worktree 路径。
+            ref: 目标 ref。
+            refresh: 为 ``True`` 时先 fetch 远程更新。
+        """
         try:
             import git  # type: ignore[import-not-found]
         except ImportError as exc:  # pragma: no cover - 防御
@@ -221,14 +277,15 @@ class GitRepositoryProvider:
         except Exception as exc:
             raise GitRepositoryError(f"无法打开本地 git 仓库: {worktree} — {exc}") from exc
 
-        try:
-            for remote in repo.remotes:
-                try:
-                    remote.fetch()
-                except Exception as exc:  # pragma: no cover - 防御
-                    logger.warning("git fetch 失败 (%s): %s", remote, exc)
-        except Exception as exc:
-            logger.warning("git fetch 出错: %s", exc)
+        if refresh:
+            try:
+                for remote in repo.remotes:
+                    try:
+                        remote.fetch()
+                    except Exception as exc:  # pragma: no cover - 防御
+                        logger.warning("git fetch 失败 (%s): %s", remote, exc)
+            except Exception as exc:
+                logger.warning("git fetch 出错: %s", exc)
 
         if ref:
             self._checkout(worktree, ref)
@@ -240,6 +297,16 @@ class GitRepositoryProvider:
                     self._checkout(worktree, default)
             except Exception as exc:  # pragma: no cover - 防御
                 logger.debug("检测默认分支失败: %s", exc)
+
+        # reset --hard + clean 确保 worktree 是干净状态
+        try:
+            repo.git.reset("--hard")
+        except Exception as exc:
+            logger.warning("git reset --hard 失败: %s", exc)
+        try:
+            repo.git.clean("-fd")
+        except Exception as exc:
+            logger.warning("git clean -fd 失败: %s", exc)
 
     def _checkout(self, worktree: Path, ref: str) -> None:
         """切换到指定 ref（branch / tag / commit）。"""

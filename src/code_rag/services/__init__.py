@@ -13,7 +13,7 @@
 from code_rag.services.eval_service import EvalOptions, EvalService
 from code_rag.services.index_service import IndexResult, IndexService
 from code_rag.services.manifest_service import ManifestEntry, ManifestService
-from code_rag.services.query_service import QueryService
+from code_rag.services.query_service import QueryService, build_retriever
 
 __all__ = [
     "EvalOptions",
@@ -23,4 +23,5 @@ __all__ = [
     "ManifestService",
     "ManifestEntry",
     "QueryService",
+    "build_retriever",
 ]

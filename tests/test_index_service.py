@@ -86,3 +86,36 @@ class TestIndexService:
         result = service.run_index(repo)
         assert result.scanned_files == 0
         assert result.chunks_generated == 0
+
+    def test_modified_file_old_chunks_cleaned(
+        self, tmp_path: Path, tmp_settings, patch_embedder
+    ) -> None:
+        """修改文件后，旧内容的 chunk 应被清除，不应翻倍。"""
+        from code_rag.store.vector_store import ChromaStore
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "a.py").write_text("def old_func():\n    return 1\n", encoding="utf-8")
+
+        service = IndexService(tmp_settings)
+        first = service.run_index(repo)
+        assert first.had_changes is True
+        first_chunk_count = first.chunks_generated
+        assert first_chunk_count > 0
+
+        # 修改 a.py
+        (repo / "a.py").write_text("def new_func():\n    return 2\n", encoding="utf-8")
+
+        second = service.run_index(repo)
+        assert second.had_changes is True
+
+        # chunk 数不应翻倍（旧 chunk 已被清理）
+        assert second.chunks_generated <= first_chunk_count
+
+        # 旧源码不应可检索
+        store = ChromaStore(tmp_settings)
+        coll_name = first.collection_name
+        stats = store.get_stats(coll_name)
+        assert stats["exists"] is True
+        # 总 chunk 数应等于第二次索引的 chunks（旧的已删除）
+        assert stats["total_chunks"] == second.chunks_generated

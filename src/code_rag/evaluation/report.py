@@ -163,3 +163,99 @@ def write_markdown_report(
     path.write_text(md, encoding="utf-8")
     logger.info("已写入 Markdown 报告: %s", path)
     return path
+
+
+def write_comparison_json_report(
+    comparison: dict[str, MetricSummary],
+    output_path: str | Path,
+    *,
+    dataset_name: str = "",
+    repo_path: str = "",
+    top_k: int = 8,
+) -> Path:
+    """Write a JSON report comparing multiple retrieval modes."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset": dataset_name,
+        "repo_path": repo_path,
+        "top_k": top_k,
+        "modes": {
+            mode: {
+                "summary": _summary_to_dict(summary),
+                "per_query": [_query_to_dict(q) for q in summary.per_query],
+            }
+            for mode, summary in comparison.items()
+        },
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    logger.info("已写入对比 JSON 报告: %s", path)
+    return path
+
+
+def render_comparison_markdown(
+    comparison: dict[str, MetricSummary],
+    *,
+    dataset_name: str = "",
+    repo_path: str = "",
+    top_k: int = 8,
+) -> str:
+    """Render a Markdown report comparing retrieval modes."""
+    lines: list[str] = []
+    lines.append(f"# Retrieval Eval Comparison — {dataset_name or 'unknown'}")
+    lines.append("")
+    lines.append(f"- Generated at: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"- Repository: `{repo_path}`")
+    lines.append(f"- top_k: {top_k}")
+    lines.append("")
+    lines.append("## Mode Summary")
+    lines.append("")
+    lines.append(
+        "| Mode | Recall@1 | Recall@3 | Recall@8 | MRR | File Hit | Symbol Hit | Avg Latency |"
+    )
+    lines.append(
+        "|------|----------|----------|----------|-----|----------|------------|-------------|"
+    )
+    for mode, summary in comparison.items():
+        lines.append(
+            f"| {mode} | {summary.recall_at_1:.2%} | {summary.recall_at_3:.2%} | "
+            f"{summary.recall_at_8:.2%} | {summary.mrr:.4f} | "
+            f"{summary.file_hit_rate:.2%} | {summary.symbol_hit_rate:.2%} | "
+            f"{summary.avg_latency_ms:.2f}ms |"
+        )
+    lines.append("")
+    lines.append("## Notes")
+    lines.append("")
+    lines.append(
+        "Hybrid retrieval should be evaluated against vector and lexical baselines before "
+        "claiming ranking improvements."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def write_comparison_markdown_report(
+    comparison: dict[str, MetricSummary],
+    output_path: str | Path,
+    *,
+    dataset_name: str = "",
+    repo_path: str = "",
+    top_k: int = 8,
+) -> Path:
+    """Write a Markdown report comparing retrieval modes."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        render_comparison_markdown(
+            comparison,
+            dataset_name=dataset_name,
+            repo_path=repo_path,
+            top_k=top_k,
+        ),
+        encoding="utf-8",
+    )
+    logger.info("已写入对比 Markdown 报告: %s", path)
+    return path

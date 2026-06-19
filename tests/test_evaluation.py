@@ -15,7 +15,10 @@ from code_rag.evaluation.metrics import (
     mean_reciprocal_rank,
 )
 from code_rag.evaluation.report import (
+    render_comparison_markdown,
     render_markdown,
+    write_comparison_json_report,
+    write_comparison_markdown_report,
     write_json_report,
     write_markdown_report,
 )
@@ -229,6 +232,42 @@ class TestEvalService:
         assert built_modes == ["lexical"]
         assert summary.recall_at_1 == 1.0
 
+    def test_compare_modes_runs_each_requested_mode(self, monkeypatch) -> None:
+        from code_rag.services.eval_service import EvalService
+
+        service = EvalService()
+        dataset = GoldenDataset(
+            name="t",
+            queries=[
+                GoldenQuery(id="q1", question="q", expected_files=["a.py"]),
+            ],
+        )
+        called_modes: list[str] = []
+
+        def fake_run(_dataset, *, repo_path, top_k, mode, ref=None):
+            called_modes.append(mode)
+            return compute_metrics(
+                [
+                    compute_query_metrics(
+                        GoldenQuery(id=f"{mode}-q", question="q", expected_files=["a.py"]),
+                        [_make_result("a.py", mode)],
+                    )
+                ]
+            )
+
+        monkeypatch.setattr(service, "run", fake_run)
+
+        comparison = service.compare_modes(
+            dataset,
+            repo_path=".",
+            modes=["vector", "lexical", "hybrid"],
+            top_k=8,
+        )
+
+        assert called_modes == ["vector", "lexical", "hybrid"]
+        assert list(comparison) == ["vector", "lexical", "hybrid"]
+        assert comparison["hybrid"].recall_at_1 == 1.0
+
 
 # ---------------------------------------------------------------------------
 # report.py
@@ -276,3 +315,54 @@ class TestReports:
         summary = compute_metrics(queries_metrics)
         text = render_markdown(summary, dataset_name="t", repo_path="/r", top_k=8, mode="vector")
         assert "## Summary" in text
+
+    def test_comparison_json_report(self, tmp_path: Path) -> None:
+        summary = compute_metrics(
+            [
+                compute_query_metrics(
+                    GoldenQuery(id="q1", question="q", expected_files=["a.py"]),
+                    [_make_result("a.py", "x")],
+                )
+            ]
+        )
+        out = tmp_path / "compare.json"
+        path = write_comparison_json_report(
+            {"vector": summary, "hybrid": summary},
+            out,
+            dataset_name="t",
+            repo_path="/r",
+            top_k=8,
+        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["dataset"] == "t"
+        assert list(data["modes"]) == ["vector", "hybrid"]
+        assert data["modes"]["hybrid"]["summary"]["recall_at_8"] == 1.0
+
+    def test_comparison_markdown_report(self, tmp_path: Path) -> None:
+        summary = compute_metrics(
+            [
+                compute_query_metrics(
+                    GoldenQuery(id="q1", question="q", expected_files=["a.py"]),
+                    [_make_result("a.py", "x")],
+                )
+            ]
+        )
+        text = render_comparison_markdown(
+            {"vector": summary, "hybrid": summary},
+            dataset_name="t",
+            repo_path="/r",
+            top_k=8,
+        )
+        assert "# Retrieval Eval Comparison" in text
+        assert "| vector |" in text
+        assert "| hybrid |" in text
+
+        out = tmp_path / "compare.md"
+        path = write_comparison_markdown_report(
+            {"vector": summary, "hybrid": summary},
+            out,
+            dataset_name="t",
+            repo_path="/r",
+            top_k=8,
+        )
+        assert "Retrieval Eval Comparison" in path.read_text(encoding="utf-8")

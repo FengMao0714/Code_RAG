@@ -124,6 +124,15 @@ _DEFAULT_IGNORE_FILENAMES: frozenset[str] = frozenset(
         ".env.development",
         ".DS_Store",
         "Thumbs.db",
+        # 敏感文件
+        ".npmrc",
+        ".pypirc",
+        "id_rsa",
+        "id_dsa",
+        "credentials.json",
+        "secrets.json",
+        "credentials.yaml",
+        "secrets.yaml",
     }
 )
 
@@ -179,6 +188,13 @@ _DEFAULT_IGNORE_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
+# 敏感内容模式（用于检测文档类文件中的敏感信息）
+_SENSITIVE_CONTENT_PATTERNS: tuple[str, ...] = (
+    "API_KEY=",
+    "SECRET=",
+    "TOKEN=",
+)
+
 # 单文件大小上限（字节）— 默认 1 MB
 MAX_FILE_SIZE: int = 1 * 1024 * 1024
 
@@ -203,14 +219,16 @@ class GitignoreFilter:
     """
 
     def __init__(self) -> None:
-        self._rules: list[tuple[str, bool]] = []
-        """(pattern, negated) 列表，按文件中出现的顺序排列。"""
+        self._rules: list[tuple[str, str, bool]] = []
+        """(base_dir, pattern, negated) 列表，按文件中出现的顺序排列。"""
 
-    def add_gitignore(self, gitignore_path: Path) -> None:
+    def add_gitignore(self, gitignore_path: Path, *, base_dir: str = "") -> None:
         """解析一个 .gitignore 文件并追加规则。
 
         Args:
             gitignore_path: .gitignore 文件的绝对路径。
+            base_dir: 规则的作用域相对路径；根目录为 ``""``，
+                子目录为相对仓库根的目录路径（如 ``"a/b"``）。
         """
         try:
             text = gitignore_path.read_text(encoding="utf-8", errors="replace")
@@ -224,7 +242,7 @@ class GitignoreFilter:
             if line.startswith("!"):
                 negated = True
                 line = line[1:]
-            self._rules.append((line, negated))
+            self._rules.append((base_dir, line, negated))
 
     def is_ignored(self, rel_path: str, is_dir: bool = False) -> bool:
         """判断 ``rel_path`` 是否应被忽略。
@@ -237,10 +255,16 @@ class GitignoreFilter:
             ``True`` 表示该路径应被 **排除**。
         """
         matched = False
-        for raw_pattern, negated in self._rules:
+        for base_dir, raw_pattern, negated in self._rules:
+            # 规则仅作用于 base_dir 及其子路径
+            if base_dir and not (rel_path == base_dir or rel_path.startswith(base_dir + "/")):
+                continue
+            scoped_rel_path = rel_path
+            if base_dir:
+                scoped_rel_path = "" if rel_path == base_dir else rel_path[len(base_dir) + 1 :]
             # 匹配时使用去除 ! 前缀的纯模式
             pattern = raw_pattern[1:] if raw_pattern.startswith("!") else raw_pattern
-            if _match_gitignore_pattern(pattern, rel_path, is_dir):
+            if _match_gitignore_pattern(pattern, scoped_rel_path, is_dir):
                 matched = not negated
         return matched
 
@@ -432,6 +456,12 @@ class RepoScanner:
             filtered_dirs: list[str] = []
             for d in dirnames:
                 abs_d = current_dir / d
+
+                # 跳过符号链接目录
+                if abs_d.is_symlink():
+                    skipped["default_dir"] += 1
+                    continue
+
                 rel_d = abs_d.relative_to(self._repo_path).as_posix()
 
                 if d in _DEFAULT_IGNORE_DIRS:
@@ -445,7 +475,8 @@ class RepoScanner:
                 # 在子目录中加载额外的 .gitignore
                 child_gitignore = abs_d / ".gitignore"
                 if child_gitignore.is_file():
-                    gitignore_filter.add_gitignore(child_gitignore)
+                    rel_dir = abs_d.relative_to(self._repo_path).as_posix()
+                    gitignore_filter.add_gitignore(child_gitignore, base_dir=rel_dir)
                     logger.debug("已加载子目录 .gitignore: %s", child_gitignore)
 
             # 原地修改 dirnames 以控制 os.walk 的递归行为
@@ -454,6 +485,12 @@ class RepoScanner:
             # --- 过滤文件 ---
             for fname in filenames:
                 abs_f = current_dir / fname
+
+                # 跳过符号链接文件
+                if abs_f.is_symlink():
+                    skipped["default_file"] += 1
+                    continue
+
                 rel_f = abs_f.relative_to(self._repo_path).as_posix()
 
                 # 跳过默认忽略的文件名
@@ -489,6 +526,12 @@ class RepoScanner:
                 language = detect_language(ext)
                 if language is None:
                     skipped["unsupported_ext"] += 1
+                    continue
+
+                # 文档类文件敏感内容检测
+                if language == "doc" and _contains_sensitive_content(abs_f):
+                    skipped["default_file"] += 1
+                    logger.debug("跳过含敏感内容的文档: %s", rel_f)
                     continue
 
                 # 计算哈希
@@ -562,3 +605,22 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _contains_sensitive_content(path: Path) -> bool:
+    """检测文档文件是否包含敏感内容模式（如 API_KEY=、SECRET=、TOKEN=）。
+
+    Args:
+        path: 文件的绝对路径。
+
+    Returns:
+        ``True`` 表示文件包含敏感内容模式。
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for pattern in _SENSITIVE_CONTENT_PATTERNS:
+        if pattern in text:
+            return True
+    return False

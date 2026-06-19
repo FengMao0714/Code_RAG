@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -435,6 +436,13 @@ class ContextBuilder:
         for i, chunk in enumerate(chunks, 1):
             try:
                 score_str = f"{scores[i - 1]:.4f}" if scores and i - 1 < len(scores) else "N/A"
+                # Escape triple (or more) backticks to prevent code fence breakout
+                safe_content = re.sub(r"`{3,}", lambda m: "` " * len(m.group()), chunk.source)
+                # Escape boundary tags to prevent context injection breakout
+                safe_content = safe_content.replace("<untrusted_context>", "< untrusted_context >")
+                safe_content = safe_content.replace(
+                    "</untrusted_context>", "< /untrusted_context >"
+                )
                 formatted = CONTEXT_CHUNK_TEMPLATE.format(
                     chunk_type=chunk.chunk_type,
                     name=chunk.name,
@@ -442,7 +450,7 @@ class ContextBuilder:
                     start_line=chunk.start_line,
                     end_line=chunk.end_line,
                     language=chunk.language,
-                    content=chunk.source,
+                    content=safe_content,
                     score=score_str,
                 )
                 formatted_chunks.append(formatted)

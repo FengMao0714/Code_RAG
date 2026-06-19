@@ -20,6 +20,7 @@ from code_rag.agent.models import (
     AgentTask,
 )
 from code_rag.agent.planner import Planner
+from code_rag.agent.report import agent_report_to_dict, render_agent_markdown, write_agent_report
 
 __all__ = [
     "AgentPlan",
@@ -28,4 +29,7 @@ __all__ = [
     "AgentTask",
     "CodeAgent",
     "Planner",
+    "agent_report_to_dict",
+    "render_agent_markdown",
+    "write_agent_report",
 ]

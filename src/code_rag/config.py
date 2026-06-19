@@ -52,6 +52,8 @@ class Settings(BaseSettings):
     """``git clone --depth`` 值；``0`` 表示完整克隆。"""
     allow_private_git: bool = False
     """是否允许私有仓库（默认 False，token 鉴权尚未实现）。"""
+    allow_file_remote: bool = False
+    """是否允许 file:// 协议的远程仓库（默认 False，仅测试使用）。"""
 
     @property
     def chroma_persist_path(self) -> Path:

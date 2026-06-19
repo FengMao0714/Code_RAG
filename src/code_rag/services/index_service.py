@@ -24,6 +24,7 @@ from code_rag.indexer import scanner as scanner_mod
 from code_rag.indexer.parser import ParsedSymbol
 from code_rag.indexer.scanner import FileEntry
 from code_rag.repository import resolve_repo
+from code_rag.services.manifest_service import ManifestService
 from code_rag.store import index_tracker as tracker_mod
 from code_rag.store.index_tracker import ChangeSet
 from code_rag.store.vector_store import ChromaStore
@@ -168,11 +169,15 @@ class IndexService:
                 collection_key=resolved.identity.collection_key,
             )
 
-        # 1. 删除已删除文件的 chunk
+        # 1. 删除已删除文件 + 已修改文件的旧 chunk
+        files_to_clean: list[str] = []
         if changes.deleted:
-            deleted_paths = [entry.rel_path for entry in changes.deleted]
-            self._store.delete_by_files(collection_name, deleted_paths)
-            cb("delete", f"已删除 {len(deleted_paths)} 个文件的索引")
+            files_to_clean.extend(entry.rel_path for entry in changes.deleted)
+        if changes.modified:
+            files_to_clean.extend(entry.rel_path for entry in changes.modified)
+        if files_to_clean:
+            self._store.delete_by_files(collection_name, files_to_clean)
+            cb("delete", f"已清理 {len(files_to_clean)} 个文件的旧索引")
 
         # 2. 解析 + 切片
         cb("chunk", "解析代码并切片...")
@@ -180,6 +185,15 @@ class IndexService:
 
         if not all_chunks:
             self._tracker.update_tracker(resolved, file_entries)
+            manifest_svc = ManifestService(self._settings)
+            stats = self._store.get_stats(collection_name)
+            manifest_svc.update_manifest(
+                repo_path=resolved,
+                file_count=len(file_entries),
+                chunk_count=int(stats.get("total_chunks", 0)),
+                chunk_types=stats.get("chunk_types", {}),
+                resolved=resolved,
+            )
             return IndexResult(
                 repo_path=resolved.root_path,
                 collection_name=collection_name,
@@ -211,6 +225,17 @@ class IndexService:
 
         # 5. 更新 tracker
         self._tracker.update_tracker(resolved, file_entries)
+
+        # 6. 写入 manifest
+        manifest_svc = ManifestService(self._settings)
+        stats = self._store.get_stats(collection_name)
+        manifest_svc.update_manifest(
+            repo_path=resolved,
+            file_count=len(file_entries),
+            chunk_count=int(stats.get("total_chunks", 0)),
+            chunk_types=stats.get("chunk_types", {}),
+            resolved=resolved,
+        )
 
         return IndexResult(
             repo_path=resolved.root_path,

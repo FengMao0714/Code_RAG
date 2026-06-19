@@ -123,17 +123,51 @@ class TestCacheListCommand:
 class TestRemoteStatusCommand:
     """``status`` 命令对 git URL 走 resolve_repo 流程。"""
 
+    def test_status_no_clone_for_unknown_url(self, tmp_path: Path) -> None:
+        """对不存在的 HTTPS URL 调用 status 不触发 GitRepositoryProvider.resolve()。"""
+        settings = Settings(
+            chroma_persist_dir=str(tmp_path / "chroma"),
+            index_tracker_dir=str(tmp_path / "indexes"),
+            repo_cache_dir=str(tmp_path / "repos"),
+            llm_api_key="x",
+            llm_base_url="http://x",
+            llm_model="m",
+            embedding_model="e",
+        )
+        url = "https://github.com/example/nonexistent-repo.git"
+        with (
+            patch("code_rag.cli.get_settings", return_value=settings),
+            patch(
+                "code_rag.services.manifest_service.resolve_repo",
+                side_effect=AssertionError("resolve_repo should not be called"),
+            ),
+        ):
+            result = runner.invoke(app, ["status", url])
+        assert result.exit_code == 0, result.output
+        assert "尚未索引" in result.output
+
     def test_status_indexed_git(self, tmp_path: Path, tmp_settings) -> None:
         # 已索引 git 仓库：写一份 manifest 之后调用 status，
         # 验证能正确显示 git 标签。
         from code_rag.services import ManifestService
 
         bare = _make_bare(tmp_path)
-        cache = CacheManager(tmp_settings.repo_cache_dir)
-        provider = GitRepositoryProvider(cache, clone_depth=1)
+        # 需要 allow_file_remote=True 才能解析 file:// URL
+        settings = Settings(
+            chroma_persist_dir=str(tmp_path / "chroma"),
+            index_tracker_dir=str(tmp_path / "indexes"),
+            repo_cache_dir=str(tmp_path / "repos"),
+            llm_api_key="x",
+            llm_base_url="http://x",
+            llm_model="m",
+            embedding_model="e",
+            allow_file_remote=True,
+        )
+        cache = CacheManager(settings.repo_cache_dir)
+        provider = GitRepositoryProvider(cache, clone_depth=1, allow_file=True)
         resolved = provider.resolve(RepoSource(raw=bare.as_uri(), kind="git"))
 
-        mservice = ManifestService(tmp_settings)
+        mservice = ManifestService(settings)
         mservice.update_manifest(
             repo_path=resolved,
             file_count=1,
@@ -141,11 +175,65 @@ class TestRemoteStatusCommand:
             resolved=resolved,
         )
 
-        with patch("code_rag.cli.get_settings", return_value=tmp_settings):
+        with patch("code_rag.cli.get_settings", return_value=settings):
             result = runner.invoke(app, ["status", bare.as_uri()])
         # status 应当返回 0，且展示 git 标签
         assert result.exit_code == 0, result.output
         assert "git" in result.output.lower() or "Git" in result.output
+
+
+class TestRemoteSearchCommand:
+    """``search`` 对未索引远程仓库应只查索引状态，不触发 clone/fetch。"""
+
+    def test_search_no_clone_for_unknown_url(self, tmp_path: Path) -> None:
+        settings = Settings(
+            chroma_persist_dir=str(tmp_path / "chroma"),
+            index_tracker_dir=str(tmp_path / "indexes"),
+            repo_cache_dir=str(tmp_path / "repos"),
+            llm_api_key="x",
+            llm_base_url="http://x",
+            llm_model="m",
+            embedding_model="e",
+        )
+        url = "https://github.com/example/nonexistent-repo.git"
+
+        with (
+            patch("code_rag.cli.get_settings", return_value=settings),
+            patch(
+                "code_rag.cli.resolve_repo",
+                side_effect=AssertionError("resolve_repo should not be called"),
+            ),
+        ):
+            result = runner.invoke(app, ["search", url, "anything"])
+
+        assert result.exit_code == 0, result.output
+        assert "尚未索引" in result.output
+        assert not settings.repo_cache_path.exists()
+
+    def test_remove_no_clone_for_unknown_url(self, tmp_path: Path) -> None:
+        settings = Settings(
+            chroma_persist_dir=str(tmp_path / "chroma"),
+            index_tracker_dir=str(tmp_path / "indexes"),
+            repo_cache_dir=str(tmp_path / "repos"),
+            llm_api_key="x",
+            llm_base_url="http://x",
+            llm_model="m",
+            embedding_model="e",
+        )
+        url = "https://github.com/example/nonexistent-repo.git"
+
+        with (
+            patch("code_rag.cli.get_settings", return_value=settings),
+            patch(
+                "code_rag.cli.resolve_repo",
+                side_effect=AssertionError("resolve_repo should not be called"),
+            ),
+        ):
+            result = runner.invoke(app, ["remove", url, "--yes"])
+
+        assert result.exit_code == 0, result.output
+        assert "已删除" in result.output
+        assert not settings.repo_cache_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +258,7 @@ class TestRemoteEndToEnd:
             llm_base_url="http://x",
             llm_model="m",
             embedding_model="e",
+            allow_file_remote=True,
         )
         url = bare.as_uri()
         fake_emb = FakeEmbedder()

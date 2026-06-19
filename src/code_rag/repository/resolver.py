@@ -10,8 +10,8 @@ import logging
 from pathlib import Path
 
 from code_rag.config import Settings, get_settings
-from code_rag.repository.cache import CacheManager
-from code_rag.repository.git import GitRepositoryProvider
+from code_rag.repository.cache import CacheManager, collection_key_for_git, collection_key_for_local
+from code_rag.repository.git import GitRepositoryProvider, canonicalize_git_url
 from code_rag.repository.local import LocalRepositoryProvider
 from code_rag.repository.models import (
     RepoSource,
@@ -53,7 +53,7 @@ def resolve_repo(
         GitRepositoryError: Git 操作失败。
     """
     cfg = settings or get_settings()
-    repo_source = parse_repo_source(source)
+    repo_source = parse_repo_source(source, allow_file=cfg.allow_file_remote)
     if ref is not None:
         # 构造新的 RepoSource 时保留 ref
         repo_source = RepoSource(raw=repo_source.raw, kind=repo_source.kind, ref=ref)
@@ -68,6 +68,7 @@ def resolve_repo(
             cache,
             clone_depth=cfg.git_clone_depth,
             allow_private=cfg.allow_private_git,
+            allow_file=cfg.allow_file_remote,
         )
         return provider.resolve(repo_source, refresh=refresh)
 
@@ -81,3 +82,30 @@ def resolve_path(path: str | Path, settings: Settings | None = None) -> Resolved
     """
     source = RepoSource(raw=str(path), kind="local", ref=None)
     return LocalRepositoryProvider().resolve(source)
+
+
+def identity_key_for_source(
+    source: str,
+    ref: str | None,
+    settings: Settings | None = None,
+) -> str:
+    """仅计算 collection_key，不触发 clone / fetch。
+
+    本地路径用 resolve 后的绝对路径计算 key；
+    Git URL 只 canonicalize 并计算 ``collection_key_for_git()``。
+
+    Args:
+        source: 用户原始输入（本地路径或 Git URL）。
+        ref: 可选 git ref。
+        settings: 应用配置。
+
+    Returns:
+        稳定的 collection_key 字符串。
+    """
+    cfg = settings or get_settings()
+    repo_source = parse_repo_source(source, allow_file=cfg.allow_file_remote)
+    if repo_source.kind == "local":
+        abs_path = Path(source).expanduser().resolve()
+        return collection_key_for_local(str(abs_path))
+    canonical = canonicalize_git_url(source)
+    return collection_key_for_git(canonical, ref)

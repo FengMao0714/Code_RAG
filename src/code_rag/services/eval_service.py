@@ -27,6 +27,7 @@ from code_rag.evaluation.report import (
 )
 from code_rag.repository import ResolvedRepo, resolve_repo
 from code_rag.retriever.lexical import LexicalRetriever
+from code_rag.retriever.modes import SearchMode
 from code_rag.retriever.retriever import Retriever
 from code_rag.store.vector_store import ChromaStore, SearchResult
 
@@ -85,11 +86,13 @@ class EvalService:
         Returns:
             :class:`MetricSummary`。
         """
+        mode = SearchMode.normalize(mode)
         resolved = resolve_repo(str(repo_path), ref=ref, settings=self._settings)
         retrievers: dict[str, Any] = {}
         per_query: list[QueryMetrics] = []
         for query in dataset.queries:
             use_mode = query.mode or mode
+            use_mode = SearchMode.normalize(use_mode)
             retriever = retrievers.setdefault(
                 use_mode,
                 self._build_retriever(resolved, use_mode),
@@ -99,6 +102,64 @@ class EvalService:
             elapsed_ms = (time.monotonic() - t0) * 1000.0
             per_query.append(compute_query_metrics(query, results, elapsed_ms=elapsed_ms))
         return compute_metrics(per_query)
+
+    def compare_modes(
+        self,
+        dataset: GoldenDataset,
+        *,
+        repo_path: str | Path,
+        modes: list[str],
+        top_k: int = 8,
+        ref: str | None = None,
+    ) -> dict[str, MetricSummary]:
+        """Run the same dataset across multiple retrieval modes."""
+        comparison: dict[str, MetricSummary] = {}
+        for mode in modes:
+            normalized_mode = SearchMode.normalize(mode)
+            comparison[normalized_mode] = self.run(
+                dataset,
+                repo_path=repo_path,
+                top_k=top_k,
+                mode=normalized_mode,
+                ref=ref,
+            )
+        return comparison
+
+    def write_comparison_reports(
+        self,
+        comparison: dict[str, MetricSummary],
+        *,
+        dataset_name: str,
+        repo_path: str,
+        top_k: int,
+        output_json: str | None = None,
+        output_markdown: str | None = None,
+    ) -> ReportPaths:
+        """Write JSON / Markdown reports for mode comparison."""
+        from code_rag.evaluation.report import (
+            write_comparison_json_report,
+            write_comparison_markdown_report,
+        )
+
+        json_path: Path | None = None
+        md_path: Path | None = None
+        if output_json:
+            json_path = write_comparison_json_report(
+                comparison,
+                output_json,
+                dataset_name=dataset_name,
+                repo_path=repo_path,
+                top_k=top_k,
+            )
+        if output_markdown:
+            md_path = write_comparison_markdown_report(
+                comparison,
+                output_markdown,
+                dataset_name=dataset_name,
+                repo_path=repo_path,
+                top_k=top_k,
+            )
+        return ReportPaths(json_path=json_path, markdown_path=md_path)
 
     def write_reports(
         self,
@@ -140,12 +201,13 @@ class EvalService:
 
     def _build_retriever(self, resolved: ResolvedRepo, mode: str) -> Any:
         """根据 mode 构造对应的检索器。"""
-        if mode == "vector":
+        mode = SearchMode.normalize(mode)
+        if mode == SearchMode.VECTOR:
             return Retriever(self._settings)
-        if mode == "lexical":
+        if mode == SearchMode.LEXICAL:
             store = ChromaStore(self._settings)
             return LexicalRetriever(store, resolved, self._settings)
-        if mode == "hybrid":
+        if mode == SearchMode.HYBRID:
             from code_rag.retriever.hybrid import HybridRetriever
             from code_rag.retriever.rerank import RRFReranker
 
@@ -167,11 +229,12 @@ class EvalService:
     ) -> list[SearchResult]:
         """调用 retriever。"""
         try:
-            if mode == "lexical":
+            mode = SearchMode.normalize(mode)
+            if mode == SearchMode.LEXICAL:
                 return retriever.search(question, top_k=top_k)
-            if mode == "vector":
+            if mode == SearchMode.VECTOR:
                 return retriever.retrieve(question, resolved, top_k=top_k)
-            if mode == "hybrid":
+            if mode == SearchMode.HYBRID:
                 return retriever.search(question, resolved, top_k=top_k)
         except Exception as exc:
             logger.warning("检索失败: %s — %s", question[:30], exc)

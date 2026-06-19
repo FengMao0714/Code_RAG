@@ -145,6 +145,22 @@ class ChromaStore:
         digest = hashlib.sha256(collection_key.encode("utf-8")).hexdigest()[:12]
         return f"code-rag-{digest}"
 
+    def _get_collection(self, name: str) -> object | None:
+        """只读获取 collection，不存在时返回 None。
+
+        用于 query 等只读操作，避免产生持久化副作用。
+
+        Args:
+            name: collection 名称。
+
+        Returns:
+            ChromaDB Collection 对象，不存在时返回 ``None``。
+        """
+        try:
+            return self._client.get_collection(name=name)  # type: ignore[union-attr]
+        except _ChromaNotFoundError:
+            return None
+
     def get_or_create_collection(self, name: str) -> object:
         """获取或创建指定名称的 collection。
 
@@ -263,7 +279,10 @@ class ChromaStore:
         Returns:
             按相关性排序的 :class:`SearchResult` 列表（距离由小到大）。
         """
-        collection = self.get_or_create_collection(collection_name)
+        collection = self._get_collection(collection_name)
+        if collection is None:
+            logger.warning("collection '%s' 不存在，无法检索", collection_name)
+            return []
 
         if collection.count() == 0:
             logger.warning("collection '%s' 为空，无法检索", collection_name)

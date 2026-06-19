@@ -166,6 +166,67 @@ class TestAgentCli:
         assert "修改建议" in result.output
         assert "建议运行的测试" in result.output
 
+    def test_agent_writes_markdown_report(
+        self, tmp_path: Path, tmp_settings, patch_embedder
+    ) -> None:
+        repo = _make_repo(tmp_path)
+        from code_rag.services import IndexService
+
+        IndexService(tmp_settings).run_index(repo)
+        out = tmp_path / "agent_report.md"
+
+        with patch("code_rag.cli.get_settings", return_value=tmp_settings):
+            result = runner.invoke(
+                app,
+                [
+                    "agent",
+                    str(repo),
+                    "解释登录流程",
+                    "--plan-only",
+                    "--output",
+                    str(out),
+                    "--format",
+                    "markdown",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert out.exists()
+        text = out.read_text(encoding="utf-8")
+        assert "# Code Agent Report" in text
+        assert "## Key Files" in text
+        assert "## Evidence" in text
+
+    def test_agent_writes_json_report(self, tmp_path: Path, tmp_settings, patch_embedder) -> None:
+        repo = _make_repo(tmp_path)
+        import json
+
+        from code_rag.services import IndexService
+
+        IndexService(tmp_settings).run_index(repo)
+        out = tmp_path / "agent_report.json"
+
+        with patch("code_rag.cli.get_settings", return_value=tmp_settings):
+            result = runner.invoke(
+                app,
+                [
+                    "agent",
+                    str(repo),
+                    "解释登录流程",
+                    "--plan-only",
+                    "--output",
+                    str(out),
+                    "--format",
+                    "json",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(out.read_text(encoding="utf-8"))
+        assert data["task"] == "解释登录流程"
+        assert data["plan"]["steps"]
+        assert "key_files" in data
+
     def test_agent_command_with_git_url_resolves_repo(self, tmp_path: Path, tmp_settings) -> None:
         # 即使仓库不存在 / 不可达，agent 命令应至少能完成 Planner + 输出
         # 这里用一个非 git 路径（_ensure_resolved 会失败），但只验证 CLI 不崩溃

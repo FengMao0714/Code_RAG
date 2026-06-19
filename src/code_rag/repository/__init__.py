@@ -27,6 +27,7 @@ from code_rag.repository.git import (
     GitRepositoryError,
     GitRepositoryProvider,
     canonicalize_git_url,
+    redact_url,
 )
 from code_rag.repository.local import LocalRepositoryProvider
 from code_rag.repository.models import (
@@ -38,7 +39,7 @@ from code_rag.repository.parser import (
     InvalidRepoSourceError,
     parse_repo_source,
 )
-from code_rag.repository.resolver import resolve_path, resolve_repo
+from code_rag.repository.resolver import identity_key_for_source, resolve_path, resolve_repo
 
 __all__ = [
     "CacheEntry",
@@ -54,7 +55,9 @@ __all__ = [
     "canonicalize_git_url",
     "collection_key_for_git",
     "collection_key_for_local",
+    "identity_key_for_source",
     "parse_repo_source",
+    "redact_url",
     "resolve_path",
     "resolve_repo",
 ]
