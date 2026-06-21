@@ -18,6 +18,7 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from code_rag.cli import app
+from code_rag.repository import identity_key_for_source
 from code_rag.store.vector_store import ChromaStore
 from tests.conftest import FakeEmbedder, FakeLLMClient
 
@@ -36,6 +37,14 @@ class TestHelp:
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
         assert "code-rag" in result.output.lower() or "代码" in result.output
+
+    def test_embeddings_list(self) -> None:
+        result = runner.invoke(app, ["embeddings", "list"])
+
+        assert result.exit_code == 0
+        assert "baseline" in result.output
+        assert "bge-m3" in result.output
+        assert "BAAI/bge-m3" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +124,31 @@ class TestIndexCommand:
 
         # 空目录没有可索引文件，可能输出"未生成任何代码切片"或直接完成
         assert result.exit_code == 0
+
+    def test_index_with_embedding_profile_uses_isolated_collection(
+        self, tmp_path: Path, tmp_settings, patch_embedder
+    ) -> None:
+        (tmp_path / "hello.py").write_text("def hello():\n    return 'world'\n", encoding="utf-8")
+
+        with (
+            patch("code_rag.cli.get_settings", return_value=tmp_settings),
+            patch("code_rag.indexer.embedder.Embedder.get_instance", return_value=patch_embedder),
+        ):
+            result = runner.invoke(
+                app,
+                ["index", str(tmp_path), "--embedding-profile", "bge-m3"],
+            )
+
+        profiled_settings = tmp_settings.model_copy(update={"embedding_profile": "bge-m3"})
+        collection_key = identity_key_for_source(str(tmp_path), None, profiled_settings)
+        collection_name = ChromaStore.get_collection_name_from_key(collection_key)
+        stats = ChromaStore(profiled_settings).get_stats(collection_name)
+
+        assert result.exit_code == 0, result.output
+        assert "bge-m3" in result.output
+        assert collection_key.endswith("__emb_bge-m3")
+        assert stats["exists"] is True
+        assert stats["total_chunks"] >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +266,44 @@ class TestSearchCommand:
         assert result.exit_code == 1
         assert "不支持的检索模式" in result.output
 
+    def test_search_with_embedding_profile_uses_profile_collection(
+        self, tmp_path: Path, tmp_settings
+    ) -> None:
+        profiled_settings = tmp_settings.model_copy(update={"embedding_profile": "bge-m3"})
+        collection_key = identity_key_for_source(str(tmp_path), None, profiled_settings)
+        collection_name = ChromaStore.get_collection_name_from_key(collection_key)
+        chunk = _make_cli_chunk("app.py", "hello", "function", "def hello(): pass", 1, 1)
+        ChromaStore(profiled_settings).upsert_chunks(
+            collection_name,
+            [chunk],
+            [FakeEmbedder._hash_embed(chunk.source)],
+        )
+
+        called_with: dict[str, str] = {}
+
+        def _fake_build(mode: str, _settings, _resolved):
+            called_with["profile"] = _settings.embedding_profile
+
+            def _search(_query, _top_k, _score_threshold):
+                from code_rag.store.vector_store import SearchResult
+
+                return [SearchResult(chunk=chunk, score=0.01)]
+
+            return _search
+
+        with (
+            patch("code_rag.cli.get_settings", return_value=tmp_settings),
+            patch("code_rag.services.query_service.build_retriever", side_effect=_fake_build),
+        ):
+            result = runner.invoke(
+                app,
+                ["search", str(tmp_path), "hello", "--embedding-profile", "bge-m3"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert called_with["profile"] == "bge-m3"
+        assert "mode=hybrid" in result.output
+
 
 # ---------------------------------------------------------------------------
 # eval
@@ -312,6 +384,111 @@ class TestEvalCommand:
         assert "模式对比" in result.output
         assert "vector" in result.output
         assert "hybrid" in result.output
+        assert out_json.exists()
+        assert out_md.exists()
+
+    def test_eval_compare_embeddings_renders_table(self, tmp_path: Path, tmp_settings) -> None:
+        """eval --compare-embeddings 应输出多模型对比表并写报告。"""
+        from code_rag.evaluation.dataset import GoldenQuery
+        from code_rag.evaluation.metrics import compute_metrics, compute_query_metrics
+        from code_rag.evaluation.report import EmbeddingComparisonResult
+
+        class _Dataset:
+            name = "demo"
+            queries = [GoldenQuery(id="q1", question="q", expected_files=["a.py"])]
+
+        class _FakeEvalService:
+            def __init__(self, _settings) -> None:
+                summary = compute_metrics(
+                    [
+                        compute_query_metrics(
+                            GoldenQuery(id="q1", question="q", expected_files=["a.py"]),
+                            [_make_cli_result("a.py", "x")],
+                        )
+                    ]
+                )
+                self.comparison = {
+                    "baseline": EmbeddingComparisonResult(
+                        profile_id="baseline",
+                        model_name="BAAI/bge-large-zh-v1.5",
+                        rationale="baseline",
+                        index_exists=True,
+                        summary=summary,
+                    ),
+                    "bge-m3": EmbeddingComparisonResult(
+                        profile_id="bge-m3",
+                        model_name="BAAI/bge-m3",
+                        rationale="candidate",
+                        index_exists=False,
+                        missing_reason="index missing",
+                    ),
+                }
+
+            def load(self, _dataset):
+                return _Dataset()
+
+            def compare_embeddings(
+                self,
+                _dataset,
+                *,
+                repo_path,
+                profiles,
+                top_k,
+                mode,
+                ref=None,
+                auto_index=False,
+            ):
+                assert profiles == ["baseline", "bge-m3"]
+                assert auto_index is False
+                return self.comparison
+
+            def write_embedding_comparison_reports(
+                self,
+                comparison,
+                *,
+                dataset_name,
+                repo_path,
+                top_k,
+                mode,
+                output_json=None,
+                output_markdown=None,
+            ):
+                from code_rag.evaluation.report import ReportPaths
+
+                if output_json:
+                    Path(output_json).write_text("{}", encoding="utf-8")
+                if output_markdown:
+                    Path(output_markdown).write_text("# embedding report\n", encoding="utf-8")
+                return ReportPaths(
+                    json_path=Path(output_json) if output_json else None,
+                    markdown_path=Path(output_markdown) if output_markdown else None,
+                )
+
+        out_json = tmp_path / "embedding_compare.json"
+        out_md = tmp_path / "embedding_compare.md"
+        with (
+            patch("code_rag.cli.get_settings", return_value=tmp_settings),
+            patch("code_rag.services.EvalService", _FakeEvalService),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "eval",
+                    str(tmp_path),
+                    "--compare-embeddings",
+                    "baseline,bge-m3",
+                    "--output",
+                    str(out_json),
+                    "--markdown",
+                    str(out_md),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Embedding 对比" in result.output
+        assert "baseline" in result.output
+        assert "bge-m3" in result.output
+        assert "missing" in result.output
         assert out_json.exists()
         assert out_md.exists()
 

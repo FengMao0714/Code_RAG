@@ -33,7 +33,8 @@ class TestManifestService:
         assert entry.file_count == 3
         assert entry.chunk_count == 10
         assert entry.chunk_types == {"function": 7, "doc": 3}
-        assert entry.embedding_model == tmp_settings.embedding_model
+        assert entry.embedding_profile == "baseline"
+        assert entry.embedding_model == "BAAI/bge-large-zh-v1.5"
 
         loaded = service.get_manifest(repo)
         assert loaded is not None

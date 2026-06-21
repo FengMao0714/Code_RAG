@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from code_rag.config import Settings, get_settings
+from code_rag.embedding_profiles import resolve_embedding_profile
 from code_rag.repository import ResolvedRepo, identity_key_for_source, resolve_repo
 from code_rag.store.vector_store import ChromaStore
 
@@ -48,6 +49,8 @@ class ManifestEntry:
         chunk_count: ChromaDB 中的 chunk 数。
         chunk_types: chunk_type 分布。
         embedding_model: 索引时使用的 Embedding 模型。
+        embedding_profile: 索引时使用的 Embedding profile ID。
+        embedding_profile_rationale: profile 选择理由。
         llm_model: 配置中的 LLM 模型。
         retrieval_top_k: 检索 top_k。
         retrieval_score_threshold: 检索距离阈值。
@@ -69,6 +72,8 @@ class ManifestEntry:
     chunk_count: int = 0
     chunk_types: dict[str, int] = field(default_factory=dict)
     embedding_model: str = ""
+    embedding_profile: str = "baseline"
+    embedding_profile_rationale: str = ""
     llm_model: str = ""
     retrieval_top_k: int = 8
     retrieval_score_threshold: float = 0.7
@@ -93,6 +98,8 @@ class ManifestEntry:
             chunk_count=int(data.get("chunk_count", 0)),
             chunk_types=dict(data.get("chunk_types", {})),
             embedding_model=str(data.get("embedding_model", "")),
+            embedding_profile=str(data.get("embedding_profile", "baseline")),
+            embedding_profile_rationale=str(data.get("embedding_profile_rationale", "")),
             llm_model=str(data.get("llm_model", "")),
             retrieval_top_k=int(data.get("retrieval_top_k", 8)),
             retrieval_score_threshold=float(data.get("retrieval_score_threshold", 0.7)),
@@ -147,6 +154,7 @@ class ManifestService:
             新写入的 :class:`ManifestEntry`。
         """
         resolved_obj = self._ensure_resolved(repo_path, resolved)
+        profile = resolve_embedding_profile(self._settings)
         collection_name = ChromaStore.get_collection_name_from_key(
             resolved_obj.identity.collection_key
         )
@@ -165,7 +173,9 @@ class ManifestService:
             file_count=file_count,
             chunk_count=chunk_count,
             chunk_types=dict(chunk_types or {}),
-            embedding_model=self._settings.embedding_model,
+            embedding_model=profile.model_name,
+            embedding_profile=profile.profile_id,
+            embedding_profile_rationale=profile.rationale,
             llm_model=self._settings.llm_model,
             retrieval_top_k=self._settings.retrieval_top_k,
             retrieval_score_threshold=self._settings.retrieval_score_threshold,

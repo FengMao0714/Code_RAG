@@ -28,11 +28,17 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.6
 
     # ---------- Embedding 配置 ----------
+    embedding_profile: str = "baseline"
+    """内置 embedding profile ID；可选 baseline / bge-m3 / e5-base / custom。"""
     embedding_model: str = "BAAI/bge-large-zh-v1.5"
     embedding_device: str = "cpu"
     embedding_cache_dir: str | None = None
     embedding_offline: bool = False
     """是否只从本地路径或 Hugging Face 缓存加载 Embedding 模型。"""
+    embedding_query_prefix: str | None = None
+    """查询文本前缀；为 None 时使用 profile 默认值。"""
+    embedding_document_prefix: str | None = None
+    """文档/chunk 文本前缀；为 None 时使用 profile 默认值。"""
 
     # ---------- ChromaDB 配置 ----------
     chroma_persist_dir: str = "~/.code-rag/chroma"

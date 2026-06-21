@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from code_rag.config import Settings, get_settings
+from code_rag.embedding_profiles import EmbeddingProfile, resolve_embedding_profile
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class Embedder:
     配置通过 :class:`Settings` 管理：
 
     - ``embedding_model``: HuggingFace 模型名称
+    - ``embedding_profile``: 内置 profile ID 或 custom
     - ``embedding_device``: 运行设备 (cpu / cuda / mps)
     - ``embedding_cache_dir``: 模型缓存目录（可选）
     """
@@ -46,8 +48,12 @@ class Embedder:
         """
         self._settings = settings or get_settings()
         self._model = None  # SentenceTransformer 实例（延迟加载）
-        self._model_name = self._settings.embedding_model
-        self._device = self._settings.embedding_device
+        self._profile: EmbeddingProfile
+        self._model_name: str
+        self._device: str
+        self._query_prefix: str
+        self._document_prefix: str
+        self._configure(self._settings)
 
     @classmethod
     def get_instance(cls, settings: Settings | None = None) -> Embedder:
@@ -66,13 +72,36 @@ class Embedder:
             cls._instance = cls(settings)
             logger.info("已创建 Embedder 单例 (model=%s)", cls._instance._model_name)
         elif settings is not None:
-            cls._instance._settings = settings
+            cls._instance._configure(settings)
         return cls._instance
 
     @classmethod
     def reset(cls) -> None:
         """重置单例（用于测试）。"""
         cls._instance = None
+
+    def _configure(self, settings: Settings) -> None:
+        """Apply settings and reset loaded model when the profile changes."""
+        profile = resolve_embedding_profile(settings)
+        old_model_name = getattr(self, "_model_name", None)
+        old_device = getattr(self, "_device", None)
+        old_cache_dir = getattr(self, "_settings", settings).embedding_cache_dir
+        old_offline = getattr(self, "_settings", settings).embedding_offline
+
+        self._settings = settings
+        self._profile = profile
+        self._model_name = profile.model_name
+        self._device = settings.embedding_device
+        self._query_prefix = profile.query_prefix
+        self._document_prefix = profile.document_prefix
+
+        if old_model_name is not None and (
+            old_model_name != self._model_name
+            or old_device != self._device
+            or old_cache_dir != settings.embedding_cache_dir
+            or old_offline != settings.embedding_offline
+        ):
+            self._model = None
 
     def _load_model(self) -> None:
         """加载 SentenceTransformer 模型（懒加载）。
@@ -202,7 +231,7 @@ class Embedder:
             else:
                 os.environ[key] = value
 
-    def _encode(self, texts: list[str]) -> list[list[float]]:
+    def _encode(self, texts: list[str], *, prefix: str = "") -> list[list[float]]:
         """底层编码方法，直接调用 SentenceTransformer.encode()。
 
         Args:
@@ -215,13 +244,21 @@ class Embedder:
             self._load_model()
 
         assert self._model is not None  # 类型守卫
+        encoded_texts = self._apply_prefix(texts, prefix)
         embeddings = self._model.encode(
-            texts,
+            encoded_texts,
             show_progress_bar=False,
             convert_to_numpy=True,
             normalize_embeddings=True,
         )
         return [vec.tolist() for vec in embeddings]
+
+    @staticmethod
+    def _apply_prefix(texts: list[str], prefix: str) -> list[str]:
+        """Apply an embedding prompt prefix without mutating caller input."""
+        if not prefix:
+            return texts
+        return [f"{prefix}{text}" for text in texts]
 
     def embed_texts(
         self,
@@ -249,7 +286,7 @@ class Embedder:
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
-            results.extend(self._encode(batch))
+            results.extend(self._encode(batch, prefix=self._document_prefix))
 
         elapsed = time.monotonic() - t0
         logger.info(
@@ -269,4 +306,4 @@ class Embedder:
         Returns:
             嵌入向量。
         """
-        return self.embed_texts([text])[0]
+        return self._encode([text], prefix=self._query_prefix)[0]

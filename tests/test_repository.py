@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from code_rag.config import Settings
 from code_rag.repository import (
     CacheManager,
     GitRepositoryError,
@@ -29,6 +30,7 @@ from code_rag.repository import (
     canonicalize_git_url,
     collection_key_for_git,
     collection_key_for_local,
+    identity_key_for_source,
     parse_repo_source,
     redact_url,
     resolve_repo,
@@ -501,6 +503,35 @@ class TestResolver:
         assert resolved.identity.source_type == "local"
         assert resolved.root_path == repo.resolve()
 
+    def test_resolve_local_baseline_keeps_legacy_collection_key(self, tmp_path: Path) -> None:
+        repo = tmp_path / "r"
+        repo.mkdir()
+
+        settings = Settings(embedding_profile="baseline")
+        resolved = resolve_repo(str(repo), settings=settings)
+
+        assert resolved.identity.collection_key == collection_key_for_local(str(repo.resolve()))
+
+    def test_resolve_local_non_baseline_uses_profile_aware_key(self, tmp_path: Path) -> None:
+        repo = tmp_path / "r"
+        repo.mkdir()
+
+        settings = Settings(embedding_profile="bge-m3")
+        resolved = resolve_repo(str(repo), settings=settings)
+
+        assert resolved.identity.collection_key.endswith("__emb_bge-m3")
+        assert resolved.identity.collection_key != collection_key_for_local(str(repo.resolve()))
+
+    def test_identity_key_for_source_is_profile_aware_without_resolve(self, tmp_path: Path) -> None:
+        repo = tmp_path / "r"
+        repo.mkdir()
+
+        baseline = identity_key_for_source(str(repo), None, Settings(embedding_profile="baseline"))
+        bge_m3 = identity_key_for_source(str(repo), None, Settings(embedding_profile="bge-m3"))
+
+        assert baseline == collection_key_for_local(str(repo.resolve()))
+        assert bge_m3 == f"{baseline}__emb_bge-m3"
+
     def test_resolve_invalid_local(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
             resolve_repo(str(tmp_path / "nope"))
@@ -513,8 +544,6 @@ class TestResolver:
 
         cache = tmp_path / "cache"
         # 这里用 settings 把 cache 指向 tmp
-        from code_rag.config import Settings
-
         settings = Settings(repo_cache_dir=str(cache))
         with pytest.raises(GitRepositoryError):
             resolve_repo(

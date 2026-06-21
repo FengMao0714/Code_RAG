@@ -15,10 +15,14 @@ from code_rag.evaluation.metrics import (
     mean_reciprocal_rank,
 )
 from code_rag.evaluation.report import (
+    EmbeddingComparisonResult,
     render_comparison_markdown,
+    render_embedding_comparison_markdown,
     render_markdown,
     write_comparison_json_report,
     write_comparison_markdown_report,
+    write_embedding_comparison_json_report,
+    write_embedding_comparison_markdown_report,
     write_json_report,
     write_markdown_report,
 )
@@ -366,3 +370,67 @@ class TestReports:
             top_k=8,
         )
         assert "Retrieval Eval Comparison" in path.read_text(encoding="utf-8")
+
+    def test_embedding_comparison_report_includes_metrics_and_missing_indexes(
+        self, tmp_path: Path
+    ) -> None:
+        summary = compute_metrics(
+            [
+                compute_query_metrics(
+                    GoldenQuery(id="q1", question="q", expected_files=["a.py"]),
+                    [_make_result("a.py", "x")],
+                )
+            ]
+        )
+        comparison = {
+            "baseline": EmbeddingComparisonResult(
+                profile_id="baseline",
+                model_name="BAAI/bge-large-zh-v1.5",
+                rationale="Current baseline.",
+                index_exists=True,
+                summary=summary,
+            ),
+            "bge-m3": EmbeddingComparisonResult(
+                profile_id="bge-m3",
+                model_name="BAAI/bge-m3",
+                rationale="Recommended cross-lingual candidate.",
+                index_exists=False,
+                missing_reason="index missing",
+            ),
+        }
+
+        text = render_embedding_comparison_markdown(
+            comparison,
+            dataset_name="t",
+            repo_path="/r",
+            top_k=8,
+            mode="hybrid",
+        )
+        assert "# Embedding Eval Comparison" in text
+        assert "| baseline | BAAI/bge-large-zh-v1.5 | indexed | 100.00% |" in text
+        assert "| bge-m3 | BAAI/bge-m3 | missing | - |" in text
+        assert "Recommended cross-lingual candidate." in text
+
+        out_json = tmp_path / "embedding_compare.json"
+        out_md = tmp_path / "embedding_compare.md"
+        write_embedding_comparison_json_report(
+            comparison,
+            out_json,
+            dataset_name="t",
+            repo_path="/r",
+            top_k=8,
+            mode="hybrid",
+        )
+        write_embedding_comparison_markdown_report(
+            comparison,
+            out_md,
+            dataset_name="t",
+            repo_path="/r",
+            top_k=8,
+            mode="hybrid",
+        )
+
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        assert data["profiles"]["baseline"]["summary"]["recall_at_1"] == 1.0
+        assert data["profiles"]["bge-m3"]["index_exists"] is False
+        assert "Embedding Eval Comparison" in out_md.read_text(encoding="utf-8")

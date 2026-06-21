@@ -7,13 +7,16 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 from code_rag.config import Settings, get_settings
+from code_rag.embedding_profiles import embedding_profile_key, resolve_embedding_profile
 from code_rag.repository.cache import CacheManager, collection_key_for_git, collection_key_for_local
 from code_rag.repository.git import GitRepositoryProvider, canonicalize_git_url
 from code_rag.repository.local import LocalRepositoryProvider
 from code_rag.repository.models import (
+    RepoIdentity,
     RepoSource,
     ResolvedRepo,
 )
@@ -60,7 +63,7 @@ def resolve_repo(
 
     if repo_source.kind == "local":
         provider = LocalRepositoryProvider()
-        return provider.resolve(repo_source)
+        return _with_embedding_profile(provider.resolve(repo_source), cfg)
 
     if repo_source.kind == "git":
         cache = CacheManager(cfg.repo_cache_dir)
@@ -70,9 +73,26 @@ def resolve_repo(
             allow_private=cfg.allow_private_git,
             allow_file=cfg.allow_file_remote,
         )
-        return provider.resolve(repo_source, refresh=refresh)
+        return _with_embedding_profile(provider.resolve(repo_source, refresh=refresh), cfg)
 
     raise ValueError(f"未知 source kind: {repo_source.kind!r}")
+
+
+def _with_embedding_profile(resolved: ResolvedRepo, settings: Settings) -> ResolvedRepo:
+    """Attach the active embedding profile to a resolved repository identity."""
+    profile = resolve_embedding_profile(settings)
+    profiled_key = embedding_profile_key(resolved.identity.collection_key, profile)
+    if profiled_key == resolved.identity.collection_key:
+        return resolved
+    identity = RepoIdentity(
+        source_type=resolved.identity.source_type,
+        display_name=resolved.identity.display_name,
+        canonical_source=resolved.identity.canonical_source,
+        ref=resolved.identity.ref,
+        commit=resolved.identity.commit,
+        collection_key=profiled_key,
+    )
+    return replace(resolved, identity=identity)
 
 
 def resolve_path(path: str | Path, settings: Settings | None = None) -> ResolvedRepo:
@@ -106,6 +126,9 @@ def identity_key_for_source(
     repo_source = parse_repo_source(source, allow_file=cfg.allow_file_remote)
     if repo_source.kind == "local":
         abs_path = Path(source).expanduser().resolve()
-        return collection_key_for_local(str(abs_path))
-    canonical = canonicalize_git_url(source)
-    return collection_key_for_git(canonical, ref)
+        base_key = collection_key_for_local(str(abs_path))
+    else:
+        canonical = canonicalize_git_url(source)
+        base_key = collection_key_for_git(canonical, ref)
+    profile = resolve_embedding_profile(cfg)
+    return embedding_profile_key(base_key, profile)

@@ -119,3 +119,31 @@ class TestIndexService:
         assert stats["exists"] is True
         # 总 chunk 数应等于第二次索引的 chunks（旧的已删除）
         assert stats["total_chunks"] == second.chunks_generated
+
+    def test_non_baseline_profile_uses_isolated_collection_and_manifest(
+        self, tmp_path: Path, tmp_settings, patch_embedder
+    ) -> None:
+        from code_rag.config import Settings
+        from code_rag.services import ManifestService
+
+        repo = _make_repo(tmp_path)
+        settings = Settings(
+            chroma_persist_dir=str(tmp_path / "chroma"),
+            index_tracker_dir=str(tmp_path / "indexes"),
+            repo_cache_dir=str(tmp_path / "repos"),
+            llm_api_key="test-key-not-real",
+            llm_base_url="http://localhost:9999/v1",
+            llm_model="fake-model",
+            embedding_profile="bge-m3",
+        )
+        service = IndexService(settings)
+
+        result = service.run_index(repo)
+        manifest, _stats = ManifestService(settings).get_status(repo)
+
+        assert result.collection_key.endswith("__emb_bge-m3")
+        assert result.collection_name != tmp_settings.embedding_model
+        assert manifest is not None
+        assert manifest.embedding_profile == "bge-m3"
+        assert manifest.embedding_model == "BAAI/bge-m3"
+        assert "cross-lingual" in manifest.embedding_profile_rationale.lower()

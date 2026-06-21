@@ -81,11 +81,13 @@ uv run code-rag agent . "评估检索架构、关键文件、风险和回归测�
 ## CLI Surface
 
 ```text
-code-rag index  <source> [--ref <git-ref>] [--refresh]
-code-rag search <source> <query> [--mode vector|lexical|hybrid] [--explain]
-code-rag ask    <source> <question> [--mode vector|lexical|hybrid]
-code-rag chat   <source> [--mode vector|lexical|hybrid]
+code-rag embeddings list
+code-rag index  <source> [--ref <git-ref>] [--refresh] [--embedding-profile baseline|bge-m3|e5-base|custom]
+code-rag search <source> <query> [--mode vector|lexical|hybrid] [--embedding-profile <profile>] [--explain]
+code-rag ask    <source> <question> [--mode vector|lexical|hybrid] [--embedding-profile <profile>]
+code-rag chat   <source> [--mode vector|lexical|hybrid] [--embedding-profile <profile>]
 code-rag eval   <source> --dataset evals/code_rag_golden.yaml [--compare-modes vector,lexical,hybrid]
+code-rag eval   <source> --dataset evals/code_rag_golden.yaml --compare-embeddings baseline,bge-m3,e5-base [--auto-index]
 code-rag agent  <source> <task> [--output report.md] [--format markdown|json]
 code-rag list
 code-rag status <source>
@@ -115,6 +117,8 @@ Code_RAG 同时保留三种检索模式：
 - 负样本、歧义样本、安全边界、远程仓库副作用、Agent 报告导出。
 
 报告示例位于 `Docs/showcase/`。如果代码或 golden dataset 更新，先刷新索引再重新生成报告：
+
+Embedding 模型也可以作为实验变量对比。`baseline` 继续使用 `BAAI/bge-large-zh-v1.5` 并兼容旧索引；`bge-m3` 是面向中文问题 + 英文/多语言代码标识符的推荐候选；`e5-base` 是较轻量的多语言对照模型。非 baseline profile 会使用独立 collection / tracker / manifest，避免不同模型的向量空间互相污染。
 
 ```powershell
 uv run code-rag index .

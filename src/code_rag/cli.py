@@ -31,6 +31,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from code_rag.config import get_settings
+from code_rag.embedding_profiles import list_embedding_profiles, resolve_embedding_profile
 from code_rag.generator import LLMClient
 from code_rag.repository import (
     CacheManager,
@@ -55,7 +56,13 @@ cache_app = typer.Typer(
     help="管理远程仓库的本地缓存（list / prune）",
     add_completion=False,
 )
+embeddings_app = typer.Typer(
+    name="embeddings",
+    help="查看和选择内置 Embedding profiles",
+    add_completion=False,
+)
 app.add_typer(cache_app)
+app.add_typer(embeddings_app)
 console = Console()
 console.legacy_windows = False  # 禁用旧版渲染器，避免 GBK 编码崩溃
 
@@ -69,6 +76,14 @@ def setup_logging(verbose: bool = False) -> None:
         datefmt="[%X]",
         handlers=[RichHandler(console=console, rich_tracebacks=True)],
     )
+
+
+def _settings_with_embedding_profile(embedding_profile: str | None):
+    """Load settings and optionally override the active embedding profile."""
+    settings = get_settings()
+    if embedding_profile:
+        settings = settings.model_copy(update={"embedding_profile": embedding_profile})
+    return settings
 
 
 # ---------------------------------------------------------------------------
@@ -91,19 +106,26 @@ def index(
     refresh: bool = typer.Option(
         False, "--refresh", help="强制刷新远程仓库缓存（仅 git URL 生效）"
     ),
+    embedding_profile: str | None = typer.Option(
+        None,
+        "--embedding-profile",
+        help="Embedding profile: baseline / bge-m3 / e5-base / custom",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
     """索引代码仓库（首次全量，后续增量更新）。支持本地路径与 Git URL。"""
     setup_logging(verbose)
 
     try:
-        settings = get_settings()
+        settings = _settings_with_embedding_profile(embedding_profile)
+        profile = resolve_embedding_profile(settings)
         kind = parse_repo_source(source, allow_file=settings.allow_file_remote).kind
         console.print(
             f"[bold blue]>> 开始索引仓库 ({kind}): {source}"
             + (f" @ {ref}" if ref else "")
             + "[/bold blue]"
         )
+        console.print(f"[dim]Embedding: {profile.profile_id} ({profile.model_name})[/dim]")
         service = IndexService(settings)
 
         with Progress(
@@ -157,6 +179,11 @@ def ask(
         "-m",
         help="检索模式: vector / lexical / hybrid",
     ),
+    embedding_profile: str | None = typer.Option(
+        None,
+        "--embedding-profile",
+        help="Embedding profile: baseline / bge-m3 / e5-base / custom",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
     """对已索引的代码仓库提问。支持本地路径与 Git URL。"""
@@ -164,7 +191,7 @@ def ask(
     console.print(f"[bold blue]>> 正在检索: {question}[/bold blue]")
 
     try:
-        settings = get_settings()
+        settings = _settings_with_embedding_profile(embedding_profile)
         service = QueryService(settings)
 
         with Progress(
@@ -217,6 +244,11 @@ def chat(
         "-m",
         help="检索模式: vector / lexical / hybrid",
     ),
+    embedding_profile: str | None = typer.Option(
+        None,
+        "--embedding-profile",
+        help="Embedding profile: baseline / bge-m3 / e5-base / custom",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
     """进入交互式对话模式。支持本地路径与 Git URL。"""
@@ -225,7 +257,7 @@ def chat(
     console.print("[dim]输入 'exit' 或 'quit' 退出[/dim]\n")
 
     try:
-        settings = get_settings()
+        settings = _settings_with_embedding_profile(embedding_profile)
         service = QueryService(settings)
     except Exception as exc:
         console.print(f"[red]初始化失败: {exc}[/red]")
@@ -305,11 +337,16 @@ def list_repos() -> None:
 def status(
     source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
     ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    embedding_profile: str | None = typer.Option(
+        None,
+        "--embedding-profile",
+        help="Embedding profile: baseline / bge-m3 / e5-base / custom",
+    ),
 ) -> None:
     """查看仓库的索引状态。支持本地路径与 Git URL。"""
     console.print(f"[bold blue]>> 仓库索引状态: {source}[/bold blue]")
 
-    settings = get_settings()
+    settings = _settings_with_embedding_profile(embedding_profile)
     service = ManifestService(settings)
     manifest, store_stats = service.get_status(source, ref=ref)
 
@@ -334,6 +371,7 @@ def status(
         console.print(f"  本地路径: {manifest.repo_path}")
         console.print(f"  Collection: {manifest.collection_name}")
         console.print(f"  最后索引: {manifest.last_indexed_at}")
+        console.print(f"  Embedding Profile: {manifest.embedding_profile}")
         console.print(f"  Embedding 模型: {manifest.embedding_model}")
         console.print(f"  LLM 模型: {manifest.llm_model}")
         console.print(f"  Tracker 文件数: {manifest.file_count}")
@@ -352,6 +390,11 @@ def status(
 def remove(
     source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
     ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    embedding_profile: str | None = typer.Option(
+        None,
+        "--embedding-profile",
+        help="Embedding profile: baseline / bge-m3 / e5-base / custom",
+    ),
     confirm: bool = typer.Option(False, "--yes", "-y", help="跳过确认"),
     with_cache: bool = typer.Option(
         False,
@@ -366,7 +409,7 @@ def remove(
             console.print("[dim]已取消[/dim]")
             return
 
-    settings = get_settings()
+    settings = _settings_with_embedding_profile(embedding_profile)
     store = store_mod.ChromaStore(settings)
     manifest_service = ManifestService(settings)
 
@@ -413,6 +456,11 @@ def search(
         help="检索模式: vector / lexical / hybrid",
     ),
     ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    embedding_profile: str | None = typer.Option(
+        None,
+        "--embedding-profile",
+        help="Embedding profile: baseline / bge-m3 / e5-base / custom",
+    ),
     explain: bool = typer.Option(False, "--explain", help="显示每条结果来自哪个检索阶段和耗时"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="显示详细日志"),
 ) -> None:
@@ -421,7 +469,7 @@ def search(
     console.print(f"[bold blue]>> 检索调试: {query}[/bold blue]")
 
     try:
-        settings = get_settings()
+        settings = _settings_with_embedding_profile(embedding_profile)
         mode = SearchMode.normalize(mode)
         store = store_mod.ChromaStore(settings)
         collection_key = identity_key_for_source(source, ref, settings=settings)
@@ -498,6 +546,11 @@ def eval(
         "-m",
         help="检索模式: vector / lexical / hybrid",
     ),
+    embedding_profile: str | None = typer.Option(
+        None,
+        "--embedding-profile",
+        help="Embedding profile: baseline / bge-m3 / e5-base / custom",
+    ),
     ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
     output: Path | None = typer.Option(None, "--output", "-o", help="JSON 报告输出路径"),
     markdown: Path | None = typer.Option(None, "--markdown", help="Markdown 报告输出路径"),
@@ -505,6 +558,16 @@ def eval(
         None,
         "--compare-modes",
         help="逗号分隔的检索模式对比，如 vector,lexical,hybrid",
+    ),
+    compare_embeddings: str | None = typer.Option(
+        None,
+        "--compare-embeddings",
+        help="逗号分隔的 Embedding profiles 对比，如 baseline,bge-m3,e5-base",
+    ),
+    auto_index: bool = typer.Option(
+        False,
+        "--auto-index",
+        help="compare-embeddings 时自动为缺失 profile 建索引",
     ),
 ) -> None:
     """对 golden query 数据集运行检索评测（不调用 LLM）。"""
@@ -514,13 +577,15 @@ def eval(
         console.print(f"[red]无法加载 EvalService: {exc}[/red]")
         raise typer.Exit(1) from None
 
-    settings = get_settings()
+    settings = _settings_with_embedding_profile(embedding_profile)
     service = EvalService(settings)
 
     console.print("[bold blue]>> 检索评测[/bold blue]")
     console.print(f"  仓库: {source}")
     console.print(f"  数据集: {dataset}")
     console.print(f"  top_k: {top_k}, mode: {mode}")
+    profile = resolve_embedding_profile(settings)
+    console.print(f"  embedding: {profile.profile_id} ({profile.model_name})")
 
     try:
         ds = service.load(dataset)
@@ -533,6 +598,77 @@ def eval(
         return
 
     console.print(f"  loaded: {len(ds.queries)} 条 golden query")
+
+    if compare_modes and compare_embeddings:
+        console.print("[red]--compare-modes 与 --compare-embeddings 不能同时使用[/red]")
+        raise typer.Exit(1)
+
+    if compare_embeddings:
+        profiles = [item.strip() for item in compare_embeddings.split(",") if item.strip()]
+        if not profiles:
+            console.print("[red]--compare-embeddings 至少需要一个 profile[/red]")
+            raise typer.Exit(1)
+
+        mode = SearchMode.normalize(mode)
+        console.print("\n[bold]Embedding 对比[/bold]")
+        comparison = service.compare_embeddings(
+            ds,
+            repo_path=source,
+            profiles=profiles,
+            top_k=top_k,
+            mode=mode,
+            ref=ref,
+            auto_index=auto_index,
+        )
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Profile", style="cyan")
+        table.add_column("Model", style="bold")
+        table.add_column("Status")
+        table.add_column("Recall@1", justify="right")
+        table.add_column("Recall@3", justify="right")
+        table.add_column("Recall@8", justify="right")
+        table.add_column("MRR", justify="right")
+        table.add_column("Latency", justify="right")
+        for result in comparison.values():
+            if result.summary is None:
+                table.add_row(
+                    result.profile_id,
+                    result.model_name,
+                    "missing",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                    "-",
+                )
+                continue
+            summary = result.summary
+            table.add_row(
+                result.profile_id,
+                result.model_name,
+                "indexed",
+                f"{summary.recall_at_1:.2%}",
+                f"{summary.recall_at_3:.2%}",
+                f"{summary.recall_at_8:.2%}",
+                f"{summary.mrr:.4f}",
+                f"{summary.avg_latency_ms:.1f}ms",
+            )
+        console.print(table)
+        if output or markdown:
+            paths = service.write_embedding_comparison_reports(
+                comparison,
+                dataset_name=ds.name,
+                repo_path=str(source),
+                top_k=top_k,
+                mode=mode,
+                output_json=str(output) if output else None,
+                output_markdown=str(markdown) if markdown else None,
+            )
+            if paths.json_path:
+                console.print(f"  JSON 报告: {paths.json_path}")
+            if paths.markdown_path:
+                console.print(f"  Markdown 报告: {paths.markdown_path}")
+        return
 
     if compare_modes:
         try:
@@ -654,6 +790,11 @@ def agent(
     source: str = typer.Argument(..., help="代码仓库路径或 Git 仓库 URL"),
     task: str = typer.Argument(..., help="Agent 任务描述（自然语言）"),
     ref: str | None = typer.Option(None, "--ref", help="git ref（仅 git URL 生效）"),
+    embedding_profile: str | None = typer.Option(
+        None,
+        "--embedding-profile",
+        help="Embedding profile: baseline / bge-m3 / e5-base / custom",
+    ),
     plan_only: bool = typer.Option(
         True,
         "--plan-only/--no-plan-only",
@@ -674,7 +815,7 @@ def agent(
     console.print(f"[dim]仓库: {source}{(' @ ' + ref) if ref else ''}[/dim]")
 
     try:
-        settings = get_settings()
+        settings = _settings_with_embedding_profile(embedding_profile)
         resolved = resolve_repo(source, ref=ref, settings=settings)
         from code_rag.agent import AgentTask, CodeAgent
 
@@ -751,6 +892,26 @@ def _print_agent_report(report, top_k: int = 5) -> None:  # type: ignore[no-unty
 # ---------------------------------------------------------------------------
 # cache 子命令
 # ---------------------------------------------------------------------------
+
+
+@embeddings_app.command("list")
+def embeddings_list() -> None:
+    """列出内置 Embedding profiles。"""
+    table = Table(title="Embedding Profiles", show_header=True, header_style="bold")
+    table.add_column("Profile", style="cyan", no_wrap=True)
+    table.add_column("Model", style="bold")
+    table.add_column("Query Prefix", style="green")
+    table.add_column("Document Prefix", style="green")
+    table.add_column("Rationale")
+    for profile in list_embedding_profiles():
+        table.add_row(
+            profile.profile_id,
+            profile.model_name,
+            profile.query_prefix or "-",
+            profile.document_prefix or "-",
+            profile.rationale,
+        )
+    console.print(table)
 
 
 @cache_app.command("list")

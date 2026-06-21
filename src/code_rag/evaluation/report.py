@@ -22,6 +22,18 @@ class ReportPaths:
     markdown_path: Path | None = None
 
 
+@dataclass(frozen=True)
+class EmbeddingComparisonResult:
+    """Single embedding profile evaluation result."""
+
+    profile_id: str
+    model_name: str
+    rationale: str
+    index_exists: bool
+    summary: MetricSummary | None = None
+    missing_reason: str = ""
+
+
 def _summary_to_dict(summary: MetricSummary) -> dict[str, Any]:
     """指标摘要序列化为字典。"""
     return {
@@ -258,4 +270,137 @@ def write_comparison_markdown_report(
         encoding="utf-8",
     )
     logger.info("已写入对比 Markdown 报告: %s", path)
+    return path
+
+
+def _embedding_result_to_dict(result: EmbeddingComparisonResult) -> dict[str, Any]:
+    """Serialize an embedding comparison result."""
+    data: dict[str, Any] = {
+        "profile_id": result.profile_id,
+        "model_name": result.model_name,
+        "rationale": result.rationale,
+        "index_exists": result.index_exists,
+        "missing_reason": result.missing_reason,
+        "summary": None,
+        "per_query": [],
+    }
+    if result.summary is not None:
+        data["summary"] = _summary_to_dict(result.summary)
+        data["per_query"] = [_query_to_dict(q) for q in result.summary.per_query]
+    return data
+
+
+def write_embedding_comparison_json_report(
+    comparison: dict[str, EmbeddingComparisonResult],
+    output_path: str | Path,
+    *,
+    dataset_name: str = "",
+    repo_path: str = "",
+    top_k: int = 8,
+    mode: str = "hybrid",
+) -> Path:
+    """Write a JSON report comparing embedding profiles."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "dataset": dataset_name,
+        "repo_path": repo_path,
+        "top_k": top_k,
+        "mode": mode,
+        "profiles": {
+            profile_id: _embedding_result_to_dict(result)
+            for profile_id, result in comparison.items()
+        },
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    logger.info("已写入 embedding 对比 JSON 报告: %s", path)
+    return path
+
+
+def render_embedding_comparison_markdown(
+    comparison: dict[str, EmbeddingComparisonResult],
+    *,
+    dataset_name: str = "",
+    repo_path: str = "",
+    top_k: int = 8,
+    mode: str = "hybrid",
+) -> str:
+    """Render a Markdown report comparing embedding profiles."""
+    lines: list[str] = []
+    lines.append(f"# Embedding Eval Comparison — {dataset_name or 'unknown'}")
+    lines.append("")
+    lines.append(f"- Generated at: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"- Repository: `{repo_path}`")
+    lines.append(f"- Retrieval mode: `{mode}`")
+    lines.append(f"- top_k: {top_k}")
+    lines.append("")
+    lines.append("## Profile Summary")
+    lines.append("")
+    lines.append(
+        "| Profile | Model | Status | Recall@1 | Recall@3 | Recall@8 | "
+        "MRR | File Hit | Symbol Hit | Avg Latency |"
+    )
+    lines.append(
+        "|---------|-------|--------|----------|----------|----------|-----|----------|------------|-------------|"
+    )
+    for result in comparison.values():
+        if result.summary is None:
+            status = "missing" if not result.index_exists else "not-run"
+            lines.append(
+                f"| {result.profile_id} | {result.model_name} | {status} | "
+                "- | - | - | - | - | - | - |"
+            )
+            continue
+        summary = result.summary
+        lines.append(
+            f"| {result.profile_id} | {result.model_name} | indexed | "
+            f"{summary.recall_at_1:.2%} | {summary.recall_at_3:.2%} | "
+            f"{summary.recall_at_8:.2%} | {summary.mrr:.4f} | "
+            f"{summary.file_hit_rate:.2%} | {summary.symbol_hit_rate:.2%} | "
+            f"{summary.avg_latency_ms:.2f}ms |"
+        )
+    lines.append("")
+    lines.append("## Model Rationale")
+    lines.append("")
+    for result in comparison.values():
+        lines.append(f"- `{result.profile_id}` / `{result.model_name}`: {result.rationale}")
+        if not result.index_exists and result.missing_reason:
+            lines.append(f"  Missing index: {result.missing_reason}")
+    lines.append("")
+    lines.append("## Notes")
+    lines.append("")
+    lines.append(
+        "Embedding model claims should be based on this local golden-query report, "
+        "not on model popularity alone."
+    )
+    return "\n".join(lines) + "\n"
+
+
+def write_embedding_comparison_markdown_report(
+    comparison: dict[str, EmbeddingComparisonResult],
+    output_path: str | Path,
+    *,
+    dataset_name: str = "",
+    repo_path: str = "",
+    top_k: int = 8,
+    mode: str = "hybrid",
+) -> Path:
+    """Write a Markdown report comparing embedding profiles."""
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        render_embedding_comparison_markdown(
+            comparison,
+            dataset_name=dataset_name,
+            repo_path=repo_path,
+            top_k=top_k,
+            mode=mode,
+        ),
+        encoding="utf-8",
+    )
+    logger.info("已写入 embedding 对比 Markdown 报告: %s", path)
     return path

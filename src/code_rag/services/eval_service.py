@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from code_rag.config import Settings, get_settings
+from code_rag.embedding_profiles import resolve_embedding_profile
 from code_rag.evaluation.dataset import GoldenDataset, load_dataset
 from code_rag.evaluation.metrics import (
     MetricSummary,
@@ -21,6 +22,7 @@ from code_rag.evaluation.metrics import (
     compute_query_metrics,
 )
 from code_rag.evaluation.report import (
+    EmbeddingComparisonResult,
     ReportPaths,
     write_json_report,
     write_markdown_report,
@@ -158,6 +160,99 @@ class EvalService:
                 dataset_name=dataset_name,
                 repo_path=repo_path,
                 top_k=top_k,
+            )
+        return ReportPaths(json_path=json_path, markdown_path=md_path)
+
+    def compare_embeddings(
+        self,
+        dataset: GoldenDataset,
+        *,
+        repo_path: str | Path,
+        profiles: list[str],
+        top_k: int = 8,
+        mode: str = "hybrid",
+        ref: str | None = None,
+        auto_index: bool = False,
+    ) -> dict[str, EmbeddingComparisonResult]:
+        """Run the same retrieval evaluation across embedding profiles."""
+        comparison: dict[str, EmbeddingComparisonResult] = {}
+        for profile_id in profiles:
+            profile_settings = self._settings.model_copy(update={"embedding_profile": profile_id})
+            profile = resolve_embedding_profile(profile_settings)
+
+            if auto_index:
+                from code_rag.services.index_service import IndexService
+
+                IndexService(profile_settings).run_index(repo_path, ref=ref)
+
+            from code_rag.services.manifest_service import ManifestService
+
+            _manifest, stats = ManifestService(profile_settings).get_status(repo_path, ref=ref)
+            if not stats.get("exists"):
+                comparison[profile.profile_id] = EmbeddingComparisonResult(
+                    profile_id=profile.profile_id,
+                    model_name=profile.model_name,
+                    rationale=profile.rationale,
+                    index_exists=False,
+                    missing_reason=(
+                        "profile-specific index missing; run "
+                        f"`code-rag index <source> --embedding-profile {profile.profile_id}`"
+                    ),
+                )
+                continue
+
+            summary = EvalService(profile_settings).run(
+                dataset,
+                repo_path=repo_path,
+                top_k=top_k,
+                mode=mode,
+                ref=ref,
+            )
+            comparison[profile.profile_id] = EmbeddingComparisonResult(
+                profile_id=profile.profile_id,
+                model_name=profile.model_name,
+                rationale=profile.rationale,
+                index_exists=True,
+                summary=summary,
+            )
+        return comparison
+
+    def write_embedding_comparison_reports(
+        self,
+        comparison: dict[str, EmbeddingComparisonResult],
+        *,
+        dataset_name: str,
+        repo_path: str,
+        top_k: int,
+        mode: str,
+        output_json: str | None = None,
+        output_markdown: str | None = None,
+    ) -> ReportPaths:
+        """Write JSON / Markdown reports for embedding profile comparison."""
+        from code_rag.evaluation.report import (
+            write_embedding_comparison_json_report,
+            write_embedding_comparison_markdown_report,
+        )
+
+        json_path: Path | None = None
+        md_path: Path | None = None
+        if output_json:
+            json_path = write_embedding_comparison_json_report(
+                comparison,
+                output_json,
+                dataset_name=dataset_name,
+                repo_path=repo_path,
+                top_k=top_k,
+                mode=mode,
+            )
+        if output_markdown:
+            md_path = write_embedding_comparison_markdown_report(
+                comparison,
+                output_markdown,
+                dataset_name=dataset_name,
+                repo_path=repo_path,
+                top_k=top_k,
+                mode=mode,
             )
         return ReportPaths(json_path=json_path, markdown_path=md_path)
 
