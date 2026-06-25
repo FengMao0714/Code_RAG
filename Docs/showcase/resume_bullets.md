@@ -8,7 +8,7 @@
 - 设计 golden query 评测体系，覆盖符号定位、流程解释、负样本、安全边界和 Agent 报告导出，自动生成 Recall@k、MRR、file hit、symbol hit、latency 的 JSON/Markdown 报告。
 - 抽象本地路径与 Git URL 仓库源，支持远程仓库缓存、ref checkout、token 脱敏，并保证未索引远程 `search/status/remove` 不触发 clone/fetch。
 - 实现只读 Code Agent，将任务拆解为子问题，通过 Hybrid 检索聚合证据，输出关键文件、修改建议、风险和建议测试，并支持 Markdown/JSON 报告导出。
-- 建立 263 个自动化测试覆盖 scanner、parser、chunker、retriever、vector store、repository、CLI、evaluation 和 agent，配合 ruff lint/format 保证工程质量。
+- 建立 283 个自动化测试覆盖 scanner、parser、chunker、retriever、vector store、repository、CLI、evaluation 和 agent，配合 ruff lint/format 保证工程质量。
 
 ## English Version
 
@@ -18,7 +18,7 @@
 - Designed a golden-query evaluation suite that reports Recall@k, MRR, file hit rate, symbol hit rate, and latency to JSON/Markdown for reproducible retrieval quality tracking.
 - Added repository-source abstraction for local paths and Git URLs, including cache management, ref checkout, URL credential redaction, unsafe scheme rejection, and no-clone behavior for unindexed read-only commands.
 - Implemented a read-only Code Agent that decomposes tasks, retrieves evidence, ranks key files, surfaces risks, recommends tests, and exports Markdown/JSON reports.
-- Maintained strong engineering coverage with 263 automated tests plus ruff lint/format checks across indexing, retrieval, repository, CLI, evaluation, and agent workflows.
+- Maintained strong engineering coverage with 283 automated tests plus ruff lint/format checks across indexing, retrieval, repository, CLI, evaluation, and agent workflows.
 
 ## 面试讲解重点
 

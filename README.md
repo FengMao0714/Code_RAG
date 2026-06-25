@@ -15,7 +15,7 @@ Code_RAG 是一个面向 **AI/RAG 工程方向** 的代码知识库 CLI：把本
 | 安全边界 | 默认拒绝不安全 URL scheme，远程 URL token 脱敏，未索引远程 search 不触发 clone/fetch |
 | 检索评测 | golden query 数据集计算 Recall@k、MRR、file hit、symbol hit、latency |
 | 只读 Code Agent | Planner -> Hybrid 检索 -> 证据汇总 -> 风险/测试建议，不自动改文件 |
-| 工程质量 | 263 个自动化测试，ruff lint/format，Windows/Linux 友好 |
+| 工程质量 | 283 个自动化测试，ruff lint/format，Windows/Linux 友好 |
 
 ## Architecture
 
@@ -148,15 +148,15 @@ uv run code-rag eval . --dataset evals/code_rag_golden.yaml --top-k 8 --mode hyb
 
 Recent local validation after this refactor:
 
-- `263 passed`
+- `283 passed`
 - `ruff check`: all checks passed
-- `ruff format --check`: 60 files already formatted
+- `ruff format --check`: 62 files already formatted
 
 ## Resume Bullets
 
 更适合直接放简历的版本见 `Docs/showcase/resume_bullets.md`。核心表达可以概括为：
 
-> 构建代码仓库 RAG CLI，基于 tree-sitter 实现 14 种语言 AST 语义切片，结合 BGE Embedding、ChromaDB、符号词法召回与 RRF 混合排序，设计 golden query 评测体系统计 Recall@k/MRR，并以 263 个自动化测试覆盖索引、检索、Git 仓库、评测和只读 Code Agent 流程。
+> 构建代码仓库 RAG CLI，基于 tree-sitter 实现 14 种语言 AST 语义切片，结合 BGE Embedding、ChromaDB、符号词法召回与 RRF 混合排序，设计 golden query 评测体系统计 Recall@k/MRR，并以 283 个自动化测试覆盖索引、检索、Git 仓库、评测和只读 Code Agent 流程。
 
 ## License
 

@@ -193,7 +193,7 @@ AST 语义切片，结合 BGE Embedding、ChromaDB、符号词法索引与 RRF �
 抽象出 RepoSource / RepoIdentity / ResolvedRepo 仓库源模型，**同一套命令支持
 本地路径与 Git 仓库 URL**，并通过 Planner → Hybrid Retriever → 证据汇总 →
 离线 Reasoner/Reviewer 输出只读修改计划；构建 golden query 评测集统计
-Recall@k/MRR，并通过 201 个自动化测试和 Windows/Linux CI 保障质量。
+Recall@k/MRR，并通过 283 个自动化测试和 Windows/Linux CI 保障质量。
 
 ---
 
